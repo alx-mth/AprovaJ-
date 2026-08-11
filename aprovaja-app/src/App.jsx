@@ -95,6 +95,52 @@ function buildChartData(sessions, days) {
   return out;
 }
 
+const WEEKDAYS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"];
+
+function emptyWeeklySchedule() {
+  const obj = {};
+  WEEKDAYS.forEach((d) => (obj[d] = []));
+  return obj;
+}
+
+// Smooth weighted round-robin: given items [{key, weight, count}], returns an
+// interleaved sequence of `key` (length = sum of counts) so that higher-weight
+// items appear more often AND spread evenly, instead of clumped together.
+function weightedInterleave(items) {
+  const pool = items.filter((it) => it.count > 0).map((it) => ({ ...it, current: 0 }));
+  const result = [];
+  let remaining = pool.reduce((a, it) => a + it.count, 0);
+  while (remaining > 0) {
+    const active = pool.filter((it) => it.count > 0);
+    const totalWeight = active.reduce((a, it) => a + it.weight, 0) || 1;
+    active.forEach((it) => (it.current += it.weight));
+    let pick = active[0];
+    active.forEach((it) => { if (it.current > pick.current) pick = it; });
+    result.push(pick.key);
+    pick.count -= 1;
+    pick.current -= totalWeight;
+    remaining -= 1;
+  }
+  return result;
+}
+
+// Splits `totalMinutes` across the given subjects proportionally to their
+// weight (priority), in blocks of `blockMinutes`, then interleaves them.
+function generateWeightedBlocks(subjectList, totalMinutes, blockMinutes) {
+  const weighted = subjectList.map((s) => ({ key: s.id, weight: s.priority || 2 }));
+  const totalWeight = weighted.reduce((a, s) => a + s.weight, 0) || 1;
+  const totalBlocks = Math.max(0, Math.round(totalMinutes / blockMinutes));
+  let assigned = 0;
+  const withCount = weighted.map((s, i) => {
+    const isLast = i === weighted.length - 1;
+    const count = isLast ? totalBlocks - assigned : Math.round((s.weight / totalWeight) * totalBlocks);
+    assigned += count;
+    return { ...s, count: Math.max(0, count) };
+  });
+  const sequence = weightedInterleave(withCount);
+  return sequence.map((subjectId) => ({ subjectId, minutes: blockMinutes }));
+}
+
 export default function AprovaJa() {
   const [loaded, setLoaded] = useState(false);
   const [subjects, setSubjects] = useState([]);
@@ -104,6 +150,7 @@ export default function AprovaJa() {
   const [sessions, setSessions] = useState([]);
   const [cycleBlocks, setCycleBlocks] = useState([]);
   const [cyclePointer, setCyclePointer] = useState({ index: 0, round: 1 });
+  const [weeklySchedule, setWeeklySchedule] = useState(emptyWeeklySchedule());
   const [view, setView] = useState("dashboard");
 
   useEffect(() => {
@@ -127,6 +174,7 @@ export default function AprovaJa() {
             setSessions(parsed.sessions || []);
             setCycleBlocks(parsed.cycleBlocks || []);
             setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
+            setWeeklySchedule(parsed.weeklySchedule || emptyWeeklySchedule());
           }
         }
       } catch (e) {
@@ -142,13 +190,13 @@ export default function AprovaJa() {
     (async () => {
       try {
         if (window.storage) {
-          await window.storage.set(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer }), false);
+          await window.storage.set(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule }), false);
         }
       } catch (e) {
         console.error("Falha ao salvar dados", e);
       }
     })();
-  }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, loaded]);
+  }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule, loaded]);
 
   const subjectById = useMemo(() => {
     const map = {};
@@ -261,10 +309,58 @@ export default function AprovaJa() {
   }
   function resetCycle() { setCyclePointer({ index: 0, round: 1 }); }
 
+  function generateCycle({ subjectIds, totalMinutes, blockMinutes }) {
+    const chosen = subjects.filter((s) => subjectIds.includes(s.id));
+    if (chosen.length === 0) return;
+    const blocks = generateWeightedBlocks(chosen, totalMinutes, blockMinutes).map((b) => ({ id: uid(), ...b }));
+    setCycleBlocks(blocks);
+    resetCycle();
+  }
+
+  function addCronogramaBlock(day, subjectId, minutes) {
+    setWeeklySchedule((prev) => ({ ...prev, [day]: [...prev[day], { id: uid(), subjectId, minutes, lastCompletedDate: null }] }));
+  }
+  function removeCronogramaBlock(day, id) {
+    setWeeklySchedule((prev) => ({ ...prev, [day]: prev[day].filter((b) => b.id !== id) }));
+  }
+  function moveCronogramaBlock(day, id, dir) {
+    setWeeklySchedule((prev) => {
+      const list = prev[day];
+      const i = list.findIndex((b) => b.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= list.length) return prev;
+      const next = [...list];
+      [next[i], next[j]] = [next[j], next[i]];
+      return { ...prev, [day]: next };
+    });
+  }
+  function completeCronogramaBlock(day, block, actualMin) {
+    addSession({
+      subjectId: block.subjectId, topicId: "", date: todayISO(),
+      grossMin: actualMin, pauseMin: 0, fromSchedule: true, day,
+    });
+    setWeeklySchedule((prev) => ({
+      ...prev,
+      [day]: prev[day].map((b) => (b.id === block.id ? { ...b, lastCompletedDate: todayISO() } : b)),
+    }));
+  }
+
+  function generateCronograma({ subjectIds, dayMinutes, blockMinutes }) {
+    const chosen = subjects.filter((s) => subjectIds.includes(s.id));
+    if (chosen.length === 0) return;
+    const next = emptyWeeklySchedule();
+    WEEKDAYS.forEach((day) => {
+      const minutes = dayMinutes[day] || 0;
+      if (minutes <= 0) return;
+      next[day] = generateWeightedBlocks(chosen, minutes, blockMinutes).map((b) => ({ id: uid(), lastCompletedDate: null, ...b }));
+    });
+    setWeeklySchedule(next);
+  }
+
   const NAV = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "subjects", label: "Disciplinas", icon: BookOpen },
-    { key: "cycle", label: "Ciclo de Estudos", icon: RefreshCw },
+    { key: "cycle", label: "Ciclo / Cronograma", icon: RefreshCw },
     { key: "quantitativo", label: "Quantitativo", icon: Target },
     { key: "questions", label: "Questões", icon: Layers },
     { key: "review", label: "Revisão", icon: RotateCcw },
@@ -290,7 +386,7 @@ export default function AprovaJa() {
       <main className="pec-main">
         {view === "dashboard" && <DashboardView totals={totals} subjectStats={subjectStats} sessions={sessions} questionLogs={questionLogs} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} setView={setView} />}
         {view === "subjects" && <SubjectsView subjectStats={subjectStats} topicsBySubject={topicsBySubject} onAdd={addSubject} onRemove={removeSubject} onAddTopic={addTopic} onRemoveTopic={removeTopic} />}
-        {view === "cycle" && <CycleView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} />}
+        {view === "cycle" && <StudyPlanView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} onGenerateCycle={generateCycle} weeklySchedule={weeklySchedule} onAddCronogramaBlock={addCronogramaBlock} onRemoveCronogramaBlock={removeCronogramaBlock} onMoveCronogramaBlock={moveCronogramaBlock} onCompleteCronograma={completeCronogramaBlock} onGenerateCronograma={generateCronograma} />}
         {view === "quantitativo" && <QuantitativoView subjects={subjects} topicsBySubject={topicsBySubject} questionLogs={questionLogs} onAdd={addQuestionLog} onRemove={removeQuestionLog} />}
         {view === "questions" && <QuestionsView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onAdd={addQuestion} onRemove={removeQuestion} />}
         {view === "review" && <ReviewView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onResult={registerReview} />}
@@ -483,13 +579,14 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTop
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
   const [color, setColor] = useState(PALETTE[0]);
+  const [priority, setPriority] = useState("2");
   const [expanded, setExpanded] = useState(null);
   const [topicDraft, setTopicDraft] = useState("");
 
   function submit(e) {
     e.preventDefault();
     if (!name.trim()) return;
-    onAdd({ name: name.trim(), goal: Number(goal) || 0, color });
+    onAdd({ name: name.trim(), goal: Number(goal) || 0, color, priority: Number(priority) });
     setName(""); setGoal("");
     setColor(PALETTE[(subjectStats.length + 1) % PALETTE.length]);
   }
@@ -514,6 +611,14 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTop
           <div className="pec-field">
             <label>Meta de questões</label>
             <input type="number" min="0" value={goal} onChange={(e) => setGoal(e.target.value)} placeholder="Ex: 300" />
+          </div>
+          <div className="pec-field">
+            <label>Prioridade</label>
+            <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+              <option value="1">Baixa</option>
+              <option value="2">Média</option>
+              <option value="3">Alta</option>
+            </select>
           </div>
           <div className="pec-field">
             <label>Cor</label>
@@ -542,6 +647,7 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTop
                   <span className="pec-card-name">{s.name}</span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                  <span className={`pec-tag ${s.priority === 3 ? "gold" : ""}`}>{s.priority === 3 ? "Alta" : s.priority === 1 ? "Baixa" : "Média"} prioridade</span>
                   <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{subTopics.length} assunto{subTopics.length !== 1 ? "s" : ""}</span>
                   <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{s.qDone}/{s.goal || 0} questões</span>
                   <button className="pec-del" onClick={(e) => { e.stopPropagation(); onRemove(s.id); }} aria-label={`Remover ${s.name}`}><Trash2 size={14} /></button>
@@ -801,7 +907,177 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
 }
 
 /* ---------------- CICLO DE ESTUDOS ---------------- */
-function CycleView({ subjects, subjectById, cycleBlocks, cyclePointer, sessions, onAddBlock, onRemoveBlock, onMoveBlock, onComplete, onSkip, onReset }) {
+function todayWeekdayName() {
+  const map = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
+  return map[new Date().getDay()];
+}
+
+function GeneratorPanel({ mode, subjects, onGenerateCycle, onGenerateCronograma, onDone }) {
+  const [open, setOpen] = useState(false);
+  const [genSubjects, setGenSubjects] = useState(subjects.map((s) => s.id));
+  const [blockMinutes, setBlockMinutes] = useState("50");
+  const [totalHours, setTotalHours] = useState("10");
+  const [dayMinutes, setDayMinutes] = useState({});
+
+  useEffect(() => { setGenSubjects(subjects.map((s) => s.id)); }, [subjects.length]);
+
+  function toggleSubject(id) {
+    setGenSubjects((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  function submit() {
+    const bm = Number(blockMinutes) || 50;
+    if (mode === "ciclo") {
+      onGenerateCycle({ subjectIds: genSubjects, totalMinutes: (Number(totalHours) || 0) * 60, blockMinutes: bm });
+    } else {
+      const numeric = {};
+      WEEKDAYS.forEach((d) => (numeric[d] = Number(dayMinutes[d]) || 0));
+      onGenerateCronograma({ subjectIds: genSubjects, dayMinutes: numeric, blockMinutes: bm });
+    }
+    setOpen(false);
+    onDone && onDone();
+  }
+
+  return (
+    <div className="pec-panel">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ marginBottom: 0 }}>Gerador automático</h3>
+        <button className="pec-submit small" onClick={() => setOpen((v) => !v)}>{open ? "Fechar" : "Gerar automaticamente"}</button>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 16 }}>
+          {subjects.length === 0 ? (
+            <div className="pec-empty">Cadastre disciplinas primeiro para poder gerar um plano.</div>
+          ) : (
+            <>
+              <div className="pec-hint" style={{ marginBottom: 10 }}>
+                Disciplinas a incluir (o peso usado é a prioridade cadastrada em Disciplinas):
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                {subjects.map((s) => (
+                  <label key={s.id} className={`pec-gen-chip ${genSubjects.includes(s.id) ? "on" : ""}`}>
+                    <input type="checkbox" checked={genSubjects.includes(s.id)} onChange={() => toggleSubject(s.id)} />
+                    <span className="pec-dot" style={{ background: s.color }} />
+                    {s.name}
+                  </label>
+                ))}
+              </div>
+
+              <div className="pec-field-grid">
+                <div className="pec-field"><label>Tamanho do bloco (min)</label><input type="number" min="10" value={blockMinutes} onChange={(e) => setBlockMinutes(e.target.value)} /></div>
+                {mode === "ciclo" && (
+                  <div className="pec-field"><label>Total de horas disponíveis (por volta)</label><input type="number" min="1" value={totalHours} onChange={(e) => setTotalHours(e.target.value)} /></div>
+                )}
+              </div>
+
+              {mode === "cronograma" && (
+                <div className="pec-field-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))" }}>
+                  {WEEKDAYS.map((day) => (
+                    <div className="pec-field" key={day}>
+                      <label>{day} (min)</label>
+                      <input type="number" min="0" value={dayMinutes[day] || ""} onChange={(e) => setDayMinutes((prev) => ({ ...prev, [day]: e.target.value }))} placeholder="0" />
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button className="pec-submit" onClick={submit} style={{ marginTop: 4 }}><Shuffle size={15} /> Gerar {mode === "ciclo" ? "ciclo" : "cronograma"}</button>
+              <div className="pec-hint" style={{ marginTop: 8 }}>
+                Isso substitui {mode === "ciclo" ? "os blocos atuais do ciclo" : "o cronograma atual"}. Depois de gerado, você pode editar tudo manualmente.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DayCard({ day, blocks, isToday, subjects, subjectById, onAdd, onRemove, onMove, onComplete }) {
+  const [addOpen, setAddOpen] = useState(false);
+  const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
+  const [minutes, setMinutes] = useState("50");
+  const [loggingId, setLoggingId] = useState(null);
+  const [actualMinutes, setActualMinutes] = useState("");
+
+  useEffect(() => { if (!subjectId && subjects.length > 0) setSubjectId(subjects[0].id); }, [subjects, subjectId]);
+
+  const totalMin = blocks.reduce((a, b) => a + b.minutes, 0);
+
+  function submitAdd(e) {
+    e.preventDefault();
+    if (!subjectId || !Number(minutes)) return;
+    onAdd(day, subjectId, Number(minutes));
+    setMinutes("50"); setAddOpen(false);
+  }
+  function openLog(block) { setLoggingId(block.id); setActualMinutes(String(block.minutes)); }
+  function confirmLog(block) { onComplete(day, block, Number(actualMinutes) || block.minutes); setLoggingId(null); }
+
+  return (
+    <div className={`pec-panel pec-daycard ${isToday ? "today" : ""}`}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <h3 style={{ marginBottom: 0 }}>{day}</h3>
+          {isToday && <span className="pec-tag gold">Hoje</span>}
+        </div>
+        <span className="pec-mono" style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{minutesToLabel(totalMin)}</span>
+      </div>
+
+      {blocks.length === 0 ? (
+        <div className="pec-empty" style={{ padding: "10px 0" }}>Nenhum bloco neste dia.</div>
+      ) : (
+        <ul className="pec-cyclelist" style={{ marginBottom: 10 }}>
+          {blocks.map((b, i) => {
+            const sub = subjectById[b.subjectId];
+            const doneToday = b.lastCompletedDate === todayISO();
+            return (
+              <li key={b.id}>
+                <span className="pec-dot" style={{ background: sub ? sub.color : "#999" }} />
+                <span className="pec-cycle-name">{sub ? sub.name : "Disciplina removida"}</span>
+                <span className="pec-mono pec-cycle-time">{minutesToLabel(b.minutes)}</span>
+                {doneToday ? (
+                  <span className="pec-tag green">Concluído hoje</span>
+                ) : loggingId === b.id ? (
+                  <form className="pec-inline-form" style={{ maxWidth: 140 }} onSubmit={(e) => { e.preventDefault(); confirmLog(b); }}>
+                    <input type="number" min="1" value={actualMinutes} onChange={(e) => setActualMinutes(e.target.value)} />
+                    <button className="pec-submit small" type="submit"><Check size={12} /></button>
+                  </form>
+                ) : (
+                  <button className="pec-submit small" onClick={() => openLog(b)}><PlayCircle size={12} /> Concluir</button>
+                )}
+                <div className="pec-cycle-actions">
+                  <button className="pec-del" onClick={() => onMove(day, b.id, -1)} disabled={i === 0} aria-label="Mover para cima"><ArrowUp size={12} /></button>
+                  <button className="pec-del" onClick={() => onMove(day, b.id, 1)} disabled={i === blocks.length - 1} aria-label="Mover para baixo"><ArrowDown size={12} /></button>
+                  <button className="pec-del" onClick={() => onRemove(day, b.id)} aria-label="Remover bloco"><Trash2 size={12} /></button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {!addOpen ? (
+        <button className="pec-submit small" onClick={() => setAddOpen(true)}><Plus size={12} /> Adicionar bloco</button>
+      ) : (
+        <form className="pec-inline-form" onSubmit={submitAdd}>
+          <select value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
+            {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <input type="number" min="1" value={minutes} onChange={(e) => setMinutes(e.target.value)} style={{ width: 64 }} />
+          <button className="pec-submit small" type="submit"><Plus size={12} /></button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function StudyPlanView({
+  subjects, subjectById, cycleBlocks, cyclePointer, sessions,
+  onAddBlock, onRemoveBlock, onMoveBlock, onComplete, onSkip, onReset, onGenerateCycle,
+  weeklySchedule, onAddCronogramaBlock, onRemoveCronogramaBlock, onMoveCronogramaBlock, onCompleteCronograma, onGenerateCronograma,
+}) {
+  const [mode, setMode] = useState("ciclo");
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
   const [minutes, setMinutes] = useState("50");
   const [logging, setLogging] = useState(false);
@@ -814,10 +1090,9 @@ function CycleView({ subjects, subjectById, cycleBlocks, cyclePointer, sessions,
   const currentSubject = currentBlock ? subjectById[currentBlock.subjectId] : null;
   const totalCycleMinutes = cycleBlocks.reduce((a, b) => a + b.minutes, 0);
 
-  const history = useMemo(
-    () => sessions.filter((s) => s.fromCycle).slice(0, 12),
-    [sessions]
-  );
+  const cycleHistory = useMemo(() => sessions.filter((s) => s.fromCycle).slice(0, 12), [sessions]);
+  const scheduleHistory = useMemo(() => sessions.filter((s) => s.fromSchedule).slice(0, 12), [sessions]);
+  const today = todayWeekdayName();
 
   function submitBlock(e) {
     e.preventDefault();
@@ -826,10 +1101,7 @@ function CycleView({ subjects, subjectById, cycleBlocks, cyclePointer, sessions,
     setMinutes("50");
   }
 
-  function openLog() {
-    setActualMinutes(String(currentBlock.minutes));
-    setLogging(true);
-  }
+  function openLog() { setActualMinutes(String(currentBlock.minutes)); setLogging(true); }
   function confirmLog(e) {
     e.preventDefault();
     onComplete(currentBlock, Number(actualMinutes) || currentBlock.minutes);
@@ -838,113 +1110,164 @@ function CycleView({ subjects, subjectById, cycleBlocks, cyclePointer, sessions,
 
   return (
     <>
-      <Header title="Ciclo de Estudos" sub="Monte a sequência de disciplinas do seu ciclo e siga bloco a bloco" />
+      <Header title="Ciclo de Estudos/Cronograma de Estudos" sub="Escolha como prefere organizar sua rotina: em ciclo de blocos que se repete, ou em cronograma fixo por dia da semana" />
 
-      <div className="pec-panel">
-        <h3>Bloco atual — rodada {cyclePointer.round}</h3>
-        {totalBlocks === 0 ? (
-          <div className="pec-empty">Monte seu ciclo abaixo cadastrando os blocos de disciplina e tempo planejado.</div>
-        ) : (
-          <div className="pec-cycle-current">
-            <div className="pec-cycle-current-info">
-              <span className="pec-dot" style={{ background: currentSubject.color, width: 13, height: 13 }} />
-              <div>
-                <div className="pec-card-name" style={{ fontSize: 18 }}>{currentSubject.name}</div>
-                <div className="pec-sub">Planejado: {minutesToLabel(currentBlock.minutes)} · bloco {cyclePointer.index + 1} de {totalBlocks}</div>
-              </div>
-            </div>
-            <div className="pec-bar-track" style={{ margin: "14px 0" }}>
-              <div className="pec-bar-fill" style={{ width: `${(cyclePointer.index / totalBlocks) * 100}%`, background: "var(--gold)" }} />
-            </div>
-            {!logging ? (
-              <div className="pec-review-actions" style={{ justifyContent: "flex-start" }}>
-                <button className="pec-submit" onClick={openLog}><PlayCircle size={15} /> Concluir bloco</button>
-                <button className="pec-submit small" style={{ background: "#8A8370" }} onClick={onSkip}><SkipForward size={14} /> Pular</button>
-              </div>
+      <div className="pec-period-filter">
+        <button className={`pec-period-btn ${mode === "ciclo" ? "active" : ""}`} onClick={() => setMode("ciclo")}>Ciclo</button>
+        <button className={`pec-period-btn ${mode === "cronograma" ? "active" : ""}`} onClick={() => setMode("cronograma")}>Cronograma</button>
+      </div>
+
+      <GeneratorPanel mode={mode} subjects={subjects} onGenerateCycle={onGenerateCycle} onGenerateCronograma={onGenerateCronograma} />
+
+      {mode === "ciclo" ? (
+        <>
+          <div className="pec-panel">
+            <h3>Bloco atual — rodada {cyclePointer.round}</h3>
+            {totalBlocks === 0 ? (
+              <div className="pec-empty">Monte seu ciclo abaixo cadastrando os blocos, ou use o gerador automático acima.</div>
             ) : (
-              <form className="pec-inline-form" onSubmit={confirmLog} style={{ maxWidth: 320 }}>
-                <input type="number" min="1" value={actualMinutes} onChange={(e) => setActualMinutes(e.target.value)} placeholder="Minutos estudados" />
-                <button className="pec-submit small" type="submit"><Check size={13} /> Registrar</button>
-              </form>
+              <div className="pec-cycle-current">
+                <div className="pec-cycle-current-info">
+                  <span className="pec-dot" style={{ background: currentSubject.color, width: 13, height: 13 }} />
+                  <div>
+                    <div className="pec-card-name" style={{ fontSize: 18 }}>{currentSubject.name}</div>
+                    <div className="pec-sub">Planejado: {minutesToLabel(currentBlock.minutes)} · bloco {cyclePointer.index + 1} de {totalBlocks}</div>
+                  </div>
+                </div>
+                <div className="pec-bar-track" style={{ margin: "14px 0" }}>
+                  <div className="pec-bar-fill" style={{ width: `${(cyclePointer.index / totalBlocks) * 100}%`, background: "var(--gold)" }} />
+                </div>
+                {!logging ? (
+                  <div className="pec-review-actions" style={{ justifyContent: "flex-start" }}>
+                    <button className="pec-submit" onClick={openLog}><PlayCircle size={15} /> Concluir bloco</button>
+                    <button className="pec-submit small" style={{ background: "#8A8370" }} onClick={onSkip}><SkipForward size={14} /> Pular</button>
+                  </div>
+                ) : (
+                  <form className="pec-inline-form" onSubmit={confirmLog} style={{ maxWidth: 320 }}>
+                    <input type="number" min="1" value={actualMinutes} onChange={(e) => setActualMinutes(e.target.value)} placeholder="Minutos estudados" />
+                    <button className="pec-submit small" type="submit"><Check size={13} /> Registrar</button>
+                  </form>
+                )}
+              </div>
             )}
           </div>
-        )}
-      </div>
 
-      <div className="pec-panel">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-          <h3 style={{ marginBottom: 0 }}>Configuração do ciclo {totalBlocks > 0 && <span className="pec-sub">· {minutesToLabel(totalCycleMinutes)} por volta</span>}</h3>
-          {totalBlocks > 0 && <button className="pec-del" onClick={onReset} title="Reiniciar rodada"><RotateCcw size={15} /></button>}
-        </div>
-
-        {subjects.length === 0 ? (
-          <div className="pec-empty">Cadastre uma disciplina primeiro para poder montar o ciclo.</div>
-        ) : (
-          <form className="pec-field-grid" onSubmit={submitBlock} style={{ marginBottom: 16, alignItems: "end" }}>
-            <div className="pec-field">
-              <label>Disciplina</label>
-              <select value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
-                {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
+          <div className="pec-panel">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <h3 style={{ marginBottom: 0 }}>Configuração do ciclo {totalBlocks > 0 && <span className="pec-sub">· {minutesToLabel(totalCycleMinutes)} por volta</span>}</h3>
+              {totalBlocks > 0 && <button className="pec-del" onClick={onReset} title="Reiniciar rodada"><RotateCcw size={15} /></button>}
             </div>
-            <div className="pec-field">
-              <label>Tempo planejado (min)</label>
-              <input type="number" min="1" value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="50" />
-            </div>
-            <div className="pec-field">
-              <button className="pec-submit" type="submit"><Plus size={15} /> Adicionar bloco</button>
-            </div>
-          </form>
-        )}
 
-        {cycleBlocks.length === 0 ? (
-          <div className="pec-empty">Nenhum bloco no ciclo ainda.</div>
-        ) : (
-          <ul className="pec-cyclelist">
-            {cycleBlocks.map((b, i) => {
-              const sub = subjectById[b.subjectId];
-              const isCurrent = i === cyclePointer.index;
-              return (
-                <li key={b.id} className={isCurrent ? "current" : ""}>
-                  <span className="pec-cycle-order">{i + 1}</span>
-                  <span className="pec-dot" style={{ background: sub ? sub.color : "#999" }} />
-                  <span className="pec-cycle-name">{sub ? sub.name : "Disciplina removida"}</span>
-                  <span className="pec-mono pec-cycle-time">{minutesToLabel(b.minutes)}</span>
-                  <div className="pec-cycle-actions">
-                    <button className="pec-del" onClick={() => onMoveBlock(b.id, -1)} disabled={i === 0} aria-label="Mover para cima"><ArrowUp size={13} /></button>
-                    <button className="pec-del" onClick={() => onMoveBlock(b.id, 1)} disabled={i === cycleBlocks.length - 1} aria-label="Mover para baixo"><ArrowDown size={13} /></button>
-                    <button className="pec-del" onClick={() => onRemoveBlock(b.id)} aria-label="Remover bloco"><Trash2 size={13} /></button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
+            {subjects.length === 0 ? (
+              <div className="pec-empty">Cadastre uma disciplina primeiro para poder montar o ciclo.</div>
+            ) : (
+              <form className="pec-field-grid" onSubmit={submitBlock} style={{ marginBottom: 16, alignItems: "end" }}>
+                <div className="pec-field">
+                  <label>Disciplina</label>
+                  <select value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
+                    {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+                <div className="pec-field">
+                  <label>Tempo planejado (min)</label>
+                  <input type="number" min="1" value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="50" />
+                </div>
+                <div className="pec-field">
+                  <button className="pec-submit" type="submit"><Plus size={15} /> Adicionar bloco</button>
+                </div>
+              </form>
+            )}
 
-      <div className="pec-panel">
-        <h3>Histórico do ciclo</h3>
-        {history.length === 0 ? (
-          <div className="pec-empty">Os blocos concluídos vão aparecer aqui, junto com a rodada em que foram feitos.</div>
-        ) : (
-          <table className="pec-table">
-            <thead><tr><th>Data</th><th>Rodada</th><th>Disciplina</th><th>Tempo estudado</th></tr></thead>
-            <tbody>
-              {history.map((s) => {
-                const sub = subjectById[s.subjectId];
-                return (
-                  <tr key={s.id}>
-                    <td className="pec-mono">{formatDateShort(s.date)}</td>
-                    <td className="pec-mono">{s.round}</td>
-                    <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
-                    <td className="pec-mono">{minutesToLabel(s.grossMin)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+            {cycleBlocks.length === 0 ? (
+              <div className="pec-empty">Nenhum bloco no ciclo ainda.</div>
+            ) : (
+              <ul className="pec-cyclelist">
+                {cycleBlocks.map((b, i) => {
+                  const sub = subjectById[b.subjectId];
+                  const isCurrent = i === cyclePointer.index;
+                  return (
+                    <li key={b.id} className={isCurrent ? "current" : ""}>
+                      <span className="pec-cycle-order">{i + 1}</span>
+                      <span className="pec-dot" style={{ background: sub ? sub.color : "#999" }} />
+                      <span className="pec-cycle-name">{sub ? sub.name : "Disciplina removida"}</span>
+                      <span className="pec-mono pec-cycle-time">{minutesToLabel(b.minutes)}</span>
+                      <div className="pec-cycle-actions">
+                        <button className="pec-del" onClick={() => onMoveBlock(b.id, -1)} disabled={i === 0} aria-label="Mover para cima"><ArrowUp size={13} /></button>
+                        <button className="pec-del" onClick={() => onMoveBlock(b.id, 1)} disabled={i === cycleBlocks.length - 1} aria-label="Mover para baixo"><ArrowDown size={13} /></button>
+                        <button className="pec-del" onClick={() => onRemoveBlock(b.id)} aria-label="Remover bloco"><Trash2 size={13} /></button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          <div className="pec-panel">
+            <h3>Histórico do ciclo</h3>
+            {cycleHistory.length === 0 ? (
+              <div className="pec-empty">Os blocos concluídos vão aparecer aqui, junto com a rodada em que foram feitos.</div>
+            ) : (
+              <table className="pec-table">
+                <thead><tr><th>Data</th><th>Rodada</th><th>Disciplina</th><th>Tempo estudado</th></tr></thead>
+                <tbody>
+                  {cycleHistory.map((s) => {
+                    const sub = subjectById[s.subjectId];
+                    return (
+                      <tr key={s.id}>
+                        <td className="pec-mono">{formatDateShort(s.date)}</td>
+                        <td className="pec-mono">{s.round}</td>
+                        <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
+                        <td className="pec-mono">{minutesToLabel(s.grossMin)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      ) : (
+        <>
+          {subjects.length === 0 ? (
+            <div className="pec-panel"><div className="pec-empty">Cadastre uma disciplina primeiro para poder montar o cronograma.</div></div>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14, marginBottom: 18 }}>
+              {WEEKDAYS.map((day) => (
+                <DayCard
+                  key={day} day={day} blocks={weeklySchedule[day] || []} isToday={day === today}
+                  subjects={subjects} subjectById={subjectById}
+                  onAdd={onAddCronogramaBlock} onRemove={onRemoveCronogramaBlock}
+                  onMove={onMoveCronogramaBlock} onComplete={onCompleteCronograma}
+                />
+              ))}
+            </div>
+          )}
+
+          <div className="pec-panel">
+            <h3>Histórico do cronograma</h3>
+            {scheduleHistory.length === 0 ? (
+              <div className="pec-empty">Os blocos concluídos pelo cronograma vão aparecer aqui.</div>
+            ) : (
+              <table className="pec-table">
+                <thead><tr><th>Data</th><th>Disciplina</th><th>Tempo estudado</th></tr></thead>
+                <tbody>
+                  {scheduleHistory.map((s) => {
+                    const sub = subjectById[s.subjectId];
+                    return (
+                      <tr key={s.id}>
+                        <td className="pec-mono">{formatDateShort(s.date)}</td>
+                        <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
+                        <td className="pec-mono">{minutesToLabel(s.grossMin)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
     </>
   );
 }
@@ -1246,13 +1569,20 @@ const STYLES = `
   .pec-cycle-current { }
   .pec-cycle-current-info { display: flex; align-items: center; gap: 12px; }
   .pec-cyclelist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-  .pec-cyclelist li { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: #FFFDF9; }
+  .pec-cyclelist li { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: #FFFDF9; flex-wrap: wrap; }
   .pec-cyclelist li.current { border-color: var(--gold); background: rgba(200,155,60,0.08); }
   .pec-cycle-order { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--ink-soft); width: 16px; }
   .pec-cycle-name { flex: 1; font-size: 13px; font-weight: 500; }
   .pec-cycle-time { font-size: 12px; color: var(--ink-soft); }
   .pec-cycle-actions { display: flex; gap: 2px; }
   .pec-cycle-actions button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .pec-gen-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 16px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; background: #FFFDF9; }
+  .pec-gen-chip.on { border-color: var(--gold); background: rgba(200,155,60,0.1); }
+  .pec-gen-chip input { accent-color: var(--gold); }
+
+  .pec-daycard.today { border-color: var(--gold); }
+  .pec-daycard .pec-inline-form select { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12.5px; background: #FFFDF9; color: var(--ink); flex: 1; }
 
   .pec-review-summary { border-bottom: 1px solid var(--line); margin-bottom: 16px; padding-bottom: 14px; }
   .pec-review-summary-title { font-family: 'Space Grotesk', sans-serif; font-size: 17px; font-weight: 600; }

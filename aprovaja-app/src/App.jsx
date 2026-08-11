@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import {
   LayoutDashboard, BookOpen, ClipboardList, Plus, Trash2, Layers,
   RotateCcw, Check, X as XIcon, ChevronDown, ChevronRight, Shuffle,
-  RefreshCw, ArrowUp, ArrowDown, SkipForward, PlayCircle
+  RefreshCw, ArrowUp, ArrowDown, SkipForward, PlayCircle, Target
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 
@@ -51,16 +51,24 @@ function isoDaysAgo(n) {
 }
 
 function sumSessions(list) {
-  let grossMin = 0, netMin = 0, qTotal = 0, qCorrect = 0;
+  let grossMin = 0, netMin = 0;
   list.forEach((s) => {
     grossMin += s.grossMin;
     netMin += Math.max(0, s.grossMin - s.pauseMin);
-    qTotal += s.qTotal;
-    qCorrect += s.qCorrect;
   });
   const efficiency = grossMin > 0 ? (netMin / grossMin) * 100 : 0;
-  const accuracy = qTotal > 0 ? (qCorrect / qTotal) * 100 : 0;
-  return { grossMin, netMin, qTotal, qCorrect, efficiency, accuracy };
+  return { grossMin, netMin, efficiency };
+}
+
+function sumQuestionLogs(list) {
+  let total = 0, correct = 0, wrong = 0;
+  list.forEach((q) => {
+    total += q.total;
+    correct += q.correct;
+    wrong += q.wrong;
+  });
+  const accuracy = total > 0 ? (correct / total) * 100 : 0;
+  return { total, correct, wrong, accuracy };
 }
 
 function buildChartData(sessions, days) {
@@ -92,39 +100,55 @@ export default function AprovaJa() {
   const [subjects, setSubjects] = useState([]);
   const [topics, setTopics] = useState([]);
   const [questions, setQuestions] = useState([]);
+  const [questionLogs, setQuestionLogs] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [cycleBlocks, setCycleBlocks] = useState([]);
   const [cyclePointer, setCyclePointer] = useState({ index: 0, round: 1 });
   const [view, setView] = useState("dashboard");
 
   useEffect(() => {
-    try {
-      let raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) raw = localStorage.getItem(LEGACY_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setSubjects(parsed.subjects || []);
-        setTopics(parsed.topics || []);
-        setQuestions(parsed.questions || []);
-        setSessions(parsed.sessions || []);
-        setCycleBlocks(parsed.cycleBlocks || []);
-        setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
+    (async () => {
+      try {
+        if (window.storage) {
+          let res = null;
+          try { res = await window.storage.get(STORAGE_KEY, false); } catch (e) { res = null; }
+          if (!res) {
+            try {
+              const legacy = await window.storage.get(LEGACY_KEY, false);
+              if (legacy && legacy.value) res = legacy;
+            } catch (e) { /* nothing */ }
+          }
+          if (res && res.value) {
+            const parsed = JSON.parse(res.value);
+            setSubjects(parsed.subjects || []);
+            setTopics(parsed.topics || []);
+            setQuestions(parsed.questions || []);
+            setQuestionLogs(parsed.questionLogs || []);
+            setSessions(parsed.sessions || []);
+            setCycleBlocks(parsed.cycleBlocks || []);
+            setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
+          }
+        }
+      } catch (e) {
+        // sem dados salvos ainda
+      } finally {
+        setLoaded(true);
       }
-    } catch (e) {
-      // sem dados salvos ainda
-    } finally {
-      setLoaded(true);
-    }
+    })();
   }, []);
 
   useEffect(() => {
     if (!loaded) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, sessions, cycleBlocks, cyclePointer }));
-    } catch (e) {
-      console.error("Falha ao salvar dados", e);
-    }
-  }, [subjects, topics, questions, sessions, cycleBlocks, cyclePointer, loaded]);
+    (async () => {
+      try {
+        if (window.storage) {
+          await window.storage.set(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer }), false);
+        }
+      } catch (e) {
+        console.error("Falha ao salvar dados", e);
+      }
+    })();
+  }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, loaded]);
 
   const subjectById = useMemo(() => {
     const map = {};
@@ -142,32 +166,35 @@ export default function AprovaJa() {
   }, [topics]);
 
   const totals = useMemo(() => {
-    let grossMin = 0, netMin = 0, qTotal = 0, qCorrect = 0;
+    let grossMin = 0, netMin = 0;
     sessions.forEach((s) => {
       grossMin += s.grossMin;
       netMin += Math.max(0, s.grossMin - s.pauseMin);
-      qTotal += s.qTotal;
-      qCorrect += s.qCorrect;
     });
     const efficiency = grossMin > 0 ? (netMin / grossMin) * 100 : 0;
-    const accuracy = qTotal > 0 ? (qCorrect / qTotal) * 100 : 0;
+    const qStats = sumQuestionLogs(questionLogs);
     const reviewed = questions.reduce((a, q) => a + (q.timesReviewed || 0), 0);
     const reviewedCorrect = questions.reduce((a, q) => a + (q.timesCorrect || 0), 0);
     const reviewAccuracy = reviewed > 0 ? (reviewedCorrect / reviewed) * 100 : 0;
-    return { grossMin, netMin, qTotal, qCorrect, efficiency, accuracy, reviewed, reviewAccuracy, flashcards: questions.length };
-  }, [sessions, questions]);
+    return {
+      grossMin, netMin, efficiency,
+      qTotal: qStats.total, qCorrect: qStats.correct, qWrong: qStats.wrong, accuracy: qStats.accuracy,
+      reviewed, reviewAccuracy, flashcards: questions.length,
+    };
+  }, [sessions, questions, questionLogs]);
 
   const subjectStats = useMemo(() => {
     return subjects.map((sub) => {
       const subSessions = sessions.filter((s) => s.subjectId === sub.id);
       const netMin = subSessions.reduce((a, s) => a + Math.max(0, s.grossMin - s.pauseMin), 0);
-      const qDone = subSessions.reduce((a, s) => a + s.qTotal, 0);
-      const qCorrect = subSessions.reduce((a, s) => a + s.qCorrect, 0);
+      const subLogs = questionLogs.filter((q) => q.subjectId === sub.id);
+      const qDone = subLogs.reduce((a, q) => a + q.total, 0);
+      const qCorrect = subLogs.reduce((a, q) => a + q.correct, 0);
       const topicCount = (topicsBySubject[sub.id] || []).length;
       const cardCount = questions.filter((q) => q.subjectId === sub.id).length;
       return { ...sub, netMin, qDone, qCorrect, accuracy: qDone > 0 ? (qCorrect / qDone) * 100 : 0, topicCount, cardCount };
     });
-  }, [subjects, sessions, topicsBySubject, questions]);
+  }, [subjects, sessions, questionLogs, topicsBySubject, questions]);
 
   function addSubject(sub) { setSubjects((prev) => [...prev, { id: uid(), ...sub }]); }
   function removeSubject(id) {
@@ -190,6 +217,9 @@ export default function AprovaJa() {
   }
   function addSession(sess) { setSessions((prev) => [{ id: uid(), ...sess }, ...prev]); }
   function removeSession(id) { setSessions((prev) => prev.filter((s) => s.id !== id)); }
+
+  function addQuestionLog(log) { setQuestionLogs((prev) => [{ id: uid(), ...log }, ...prev]); }
+  function removeQuestionLog(id) { setQuestionLogs((prev) => prev.filter((q) => q.id !== id)); }
 
   function addCycleBlock(subjectId, minutes) {
     setCycleBlocks((prev) => [...prev, { id: uid(), subjectId, minutes }]);
@@ -214,7 +244,7 @@ export default function AprovaJa() {
   function completeCycleBlock(block, actualMin) {
     addSession({
       subjectId: block.subjectId, topicId: "", date: todayISO(),
-      grossMin: actualMin, pauseMin: 0, qTotal: 0, qCorrect: 0,
+      grossMin: actualMin, pauseMin: 0,
       fromCycle: true, round: cyclePointer.round,
     });
     advanceCycle();
@@ -235,6 +265,7 @@ export default function AprovaJa() {
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "subjects", label: "Disciplinas", icon: BookOpen },
     { key: "cycle", label: "Ciclo de Estudos", icon: RefreshCw },
+    { key: "quantitativo", label: "Quantitativo", icon: Target },
     { key: "questions", label: "Questões", icon: Layers },
     { key: "review", label: "Revisão", icon: RotateCcw },
     { key: "sessions", label: "Registrar Estudo", icon: ClipboardList },
@@ -257,9 +288,10 @@ export default function AprovaJa() {
       </aside>
 
       <main className="pec-main">
-        {view === "dashboard" && <DashboardView totals={totals} subjectStats={subjectStats} sessions={sessions} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} setView={setView} />}
+        {view === "dashboard" && <DashboardView totals={totals} subjectStats={subjectStats} sessions={sessions} questionLogs={questionLogs} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} setView={setView} />}
         {view === "subjects" && <SubjectsView subjectStats={subjectStats} topicsBySubject={topicsBySubject} onAdd={addSubject} onRemove={removeSubject} onAddTopic={addTopic} onRemoveTopic={removeTopic} />}
         {view === "cycle" && <CycleView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} />}
+        {view === "quantitativo" && <QuantitativoView subjects={subjects} topicsBySubject={topicsBySubject} questionLogs={questionLogs} onAdd={addQuestionLog} onRemove={removeQuestionLog} />}
         {view === "questions" && <QuestionsView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onAdd={addQuestion} onRemove={removeQuestion} />}
         {view === "review" && <ReviewView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onResult={registerReview} />}
         {view === "sessions" && <SessionsView subjects={subjects} topicsBySubject={topicsBySubject} sessions={sessions} onAdd={addSession} onRemove={removeSession} />}
@@ -269,7 +301,7 @@ export default function AprovaJa() {
 }
 
 /* ---------------- DASHBOARD ---------------- */
-function DashboardView({ totals, subjectStats, sessions, subjectById, cycleBlocks, cyclePointer, setView }) {
+function DashboardView({ totals, subjectStats, sessions, questionLogs, subjectById, cycleBlocks, cyclePointer, setView }) {
   const [period, setPeriod] = useState("semana");
   const periodDef = PERIODS.find((p) => p.key === period);
 
@@ -278,9 +310,16 @@ function DashboardView({ totals, subjectStats, sessions, subjectById, cycleBlock
     return sessions.filter((s) => s.date >= start);
   }, [sessions, periodDef]);
 
+  const periodQuestionLogs = useMemo(() => {
+    const start = isoDaysAgo(periodDef.days - 1);
+    return questionLogs.filter((q) => q.date >= start);
+  }, [questionLogs, periodDef]);
+
   const periodTotals = useMemo(() => sumSessions(periodSessions), [periodSessions]);
+  const periodQStats = useMemo(() => sumQuestionLogs(periodQuestionLogs), [periodQuestionLogs]);
   const chartData = useMemo(() => buildChartData(sessions, periodDef.days), [sessions, periodDef]);
-  const recent = periodSessions.slice(0, 6);
+  const recentSessions = periodSessions.slice(0, 6);
+  const recentLogs = periodQuestionLogs.slice(0, 6);
 
   const currentBlock = cycleBlocks[cyclePointer.index] || null;
   const currentSubject = currentBlock ? subjectById[currentBlock.subjectId] : null;
@@ -322,8 +361,8 @@ function DashboardView({ totals, subjectStats, sessions, subjectById, cycleBlock
         <div className="pec-ledger">
           <LedgerItem label="Horas brutas" value={minutesToLabel(periodTotals.grossMin)} sub={`dedicadas ${periodDef.noun}`} />
           <LedgerItem label="Horas líquidas" value={minutesToLabel(periodTotals.netMin)} sub="descontadas as pausas" cls="green" />
-          <LedgerItem label="Questões (sessões)" value={periodTotals.qTotal} sub={`${periodTotals.qCorrect} acertos`} />
-          <LedgerItem label="Precisão" value={periodTotals.qTotal > 0 ? `${periodTotals.accuracy.toFixed(0)}%` : "—"} sub={`taxa de acerto ${periodDef.noun}`} cls="gold" />
+          <LedgerItem label="Questões resolvidas" value={periodQStats.total} sub={`${periodQStats.correct} certas · ${periodQStats.wrong} erradas`} />
+          <LedgerItem label="Precisão" value={periodQStats.total > 0 ? `${periodQStats.accuracy.toFixed(0)}%` : "—"} sub={`taxa de acerto ${periodDef.noun}`} cls="gold" />
         </div>
       </div>
 
@@ -370,21 +409,21 @@ function DashboardView({ totals, subjectStats, sessions, subjectById, cycleBlock
         </div>
 
         <div className="pec-panel">
-          <h3>Últimos registros</h3>
-          {recent.length === 0 ? (
-            <div className="pec-empty">Suas sessões de estudo mais recentes vão aparecer aqui.</div>
+          <h3>Últimas questões lançadas</h3>
+          {recentLogs.length === 0 ? (
+            <div className="pec-empty">Seus lançamentos de quantitativo mais recentes vão aparecer aqui.</div>
           ) : (
             <table className="pec-table">
-              <thead><tr><th>Data</th><th>Disciplina</th><th>Líquido</th><th>Questões</th></tr></thead>
+              <thead><tr><th>Data</th><th>Disciplina</th><th>Total</th><th>Certas/Erradas</th></tr></thead>
               <tbody>
-                {recent.map((s) => {
-                  const sub = subjectById[s.subjectId];
+                {recentLogs.map((q) => {
+                  const sub = subjectById[q.subjectId];
                   return (
-                    <tr key={s.id}>
-                      <td className="pec-mono">{formatDateShort(s.date)}</td>
+                    <tr key={q.id}>
+                      <td className="pec-mono">{formatDateShort(q.date)}</td>
                       <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
-                      <td className="pec-mono">{minutesToLabel(Math.max(0, s.grossMin - s.pauseMin))}</td>
-                      <td className="pec-mono">{s.qCorrect}/{s.qTotal}</td>
+                      <td className="pec-mono">{q.total}</td>
+                      <td className="pec-mono">{q.correct}/{q.wrong}</td>
                     </tr>
                   );
                 })}
@@ -392,6 +431,29 @@ function DashboardView({ totals, subjectStats, sessions, subjectById, cycleBlock
             </table>
           )}
         </div>
+      </div>
+
+      <div className="pec-panel">
+        <h3>Últimas sessões de estudo</h3>
+        {recentSessions.length === 0 ? (
+          <div className="pec-empty">Suas sessões de estudo mais recentes vão aparecer aqui.</div>
+        ) : (
+          <table className="pec-table">
+            <thead><tr><th>Data</th><th>Disciplina</th><th>Líquido</th></tr></thead>
+            <tbody>
+              {recentSessions.map((s) => {
+                const sub = subjectById[s.subjectId];
+                return (
+                  <tr key={s.id}>
+                    <td className="pec-mono">{formatDateShort(s.date)}</td>
+                    <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
+                    <td className="pec-mono">{minutesToLabel(Math.max(0, s.grossMin - s.pauseMin))}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
     </>
   );
@@ -887,6 +949,110 @@ function CycleView({ subjects, subjectById, cycleBlocks, cyclePointer, sessions,
   );
 }
 
+/* ---------------- QUANTITATIVO DE QUESTÕES ---------------- */
+function QuantitativoView({ subjects, topicsBySubject, questionLogs, onAdd, onRemove }) {
+  const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
+  const [topicId, setTopicId] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [total, setTotal] = useState("");
+  const [correct, setCorrect] = useState("");
+  const [wrong, setWrong] = useState("");
+  const [filterSubject, setFilterSubject] = useState("");
+
+  useEffect(() => { if (!subjectId && subjects.length > 0) setSubjectId(subjects[0].id); }, [subjects, subjectId]);
+  useEffect(() => { setTopicId(""); }, [subjectId]);
+
+  const subjectTopics = topicsBySubject[subjectId] || [];
+  const subjectById = useMemo(() => { const m = {}; subjects.forEach((s) => (m[s.id] = s)); return m; }, [subjects]);
+  const topicNameById = useMemo(() => { const m = {}; Object.values(topicsBySubject).flat().forEach((t) => (m[t.id] = t.name)); return m; }, [topicsBySubject]);
+
+  function submit(e) {
+    e.preventDefault();
+    if (!subjectId || !Number(total)) return;
+    onAdd({
+      subjectId, topicId: topicId || "", date,
+      total: Number(total) || 0, correct: Number(correct) || 0, wrong: Number(wrong) || 0,
+    });
+    setTotal(""); setCorrect(""); setWrong("");
+  }
+
+  const filtered = filterSubject ? questionLogs.filter((q) => q.subjectId === filterSubject) : questionLogs;
+  const filteredStats = useMemo(() => sumQuestionLogs(filtered), [filtered]);
+
+  return (
+    <>
+      <Header title="Quantitativo de Questões" sub="Lance a quantidade de questões feitas por disciplina, sem precisar criar flashcards" />
+
+      {subjects.length === 0 ? (
+        <div className="pec-panel"><div className="pec-empty">Cadastre uma disciplina antes de lançar um quantitativo.</div></div>
+      ) : (
+        <form className="pec-form" onSubmit={submit}>
+          <h3>Novo lançamento</h3>
+          <div className="pec-field-grid">
+            <div className="pec-field">
+              <label>Disciplina</label>
+              <select value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
+                {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div className="pec-field">
+              <label>Assunto (opcional)</label>
+              <select value={topicId} onChange={(e) => setTopicId(e.target.value)}>
+                <option value="">Geral</option>
+                {subjectTopics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            <div className="pec-field"><label>Data</label><input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></div>
+            <div className="pec-field"><label>Quantidade total</label><input type="number" min="0" value={total} onChange={(e) => setTotal(e.target.value)} placeholder="0" /></div>
+            <div className="pec-field"><label>Quantidade certa</label><input type="number" min="0" value={correct} onChange={(e) => setCorrect(e.target.value)} placeholder="0" /></div>
+            <div className="pec-field"><label>Quantidade errada</label><input type="number" min="0" value={wrong} onChange={(e) => setWrong(e.target.value)} placeholder="0" /></div>
+          </div>
+          <button className="pec-submit" type="submit"><Plus size={15} /> Adicionar lançamento</button>
+        </form>
+      )}
+
+      <div className="pec-panel">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <h3 style={{ marginBottom: 0 }}>Histórico ({filtered.length})</h3>
+          <select className="pec-filter" value={filterSubject} onChange={(e) => setFilterSubject(e.target.value)}>
+            <option value="">Todas as disciplinas</option>
+            {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+
+        {filtered.length === 0 ? (
+          <div className="pec-empty">Nenhum lançamento ainda.</div>
+        ) : (
+          <>
+            <div className="pec-hint" style={{ marginBottom: 10 }}>
+              Total: <strong className="pec-mono">{filteredStats.total}</strong> · Certas: <strong className="pec-mono">{filteredStats.correct}</strong> · Erradas: <strong className="pec-mono">{filteredStats.wrong}</strong> · Precisão: <strong className="pec-mono">{filteredStats.total > 0 ? filteredStats.accuracy.toFixed(0) : "—"}%</strong>
+            </div>
+            <table className="pec-table">
+              <thead><tr><th>Data</th><th>Disciplina</th><th>Assunto</th><th>Total</th><th>Certas</th><th>Erradas</th><th></th></tr></thead>
+              <tbody>
+                {filtered.map((q) => {
+                  const sub = subjectById[q.subjectId];
+                  return (
+                    <tr key={q.id}>
+                      <td className="pec-mono">{formatDateShort(q.date)}</td>
+                      <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
+                      <td style={{ color: "#3B4A6B" }}>{q.topicId && topicNameById[q.topicId] ? topicNameById[q.topicId] : "—"}</td>
+                      <td className="pec-mono">{q.total}</td>
+                      <td className="pec-mono">{q.correct}</td>
+                      <td className="pec-mono">{q.wrong}</td>
+                      <td><button className="pec-del" onClick={() => onRemove(q.id)} aria-label="Remover lançamento"><Trash2 size={13} /></button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
 /* ---------------- REGISTRAR ESTUDO ---------------- */
 function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) {
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
@@ -895,8 +1061,6 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
   const [hours, setHours] = useState("");
   const [minutes, setMinutes] = useState("");
   const [pause, setPause] = useState("0");
-  const [qTotal, setQTotal] = useState("");
-  const [qCorrect, setQCorrect] = useState("");
 
   useEffect(() => { if (!subjectId && subjects.length > 0) setSubjectId(subjects[0].id); }, [subjects, subjectId]);
   useEffect(() => { setTopicId(""); }, [subjectId]);
@@ -911,9 +1075,8 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
     onAdd({
       subjectId, topicId: topicId || "", date,
       grossMin: grossMinPreview, pauseMin: Number(pause) || 0,
-      qTotal: Number(qTotal) || 0, qCorrect: Math.min(Number(qCorrect) || 0, Number(qTotal) || 0),
     });
-    setHours(""); setMinutes(""); setPause("0"); setQTotal(""); setQCorrect("");
+    setHours(""); setMinutes(""); setPause("0");
   }
 
   const subjectById = useMemo(() => { const m = {}; subjects.forEach((s) => (m[s.id] = s)); return m; }, [subjects]);
@@ -921,7 +1084,7 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
 
   return (
     <>
-      <Header title="Registrar Estudo" sub="Anote cada sessão de estudo com tempo bruto, pausas e questões resolvidas" />
+      <Header title="Registrar Estudo" sub="Anote cada sessão de estudo com tempo bruto e pausas" />
 
       {subjects.length === 0 ? (
         <div className="pec-panel"><div className="pec-empty">Cadastre uma disciplina antes de registrar uma sessão de estudo.</div></div>
@@ -946,8 +1109,6 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
             <div className="pec-field"><label>Horas brutas</label><input type="number" min="0" value={hours} onChange={(e) => setHours(e.target.value)} placeholder="0" /></div>
             <div className="pec-field"><label>Minutos brutos</label><input type="number" min="0" max="59" value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="0" /></div>
             <div className="pec-field"><label>Pausas / distrações (min)</label><input type="number" min="0" value={pause} onChange={(e) => setPause(e.target.value)} placeholder="0" /></div>
-            <div className="pec-field"><label>Questões resolvidas</label><input type="number" min="0" value={qTotal} onChange={(e) => setQTotal(e.target.value)} placeholder="0" /></div>
-            <div className="pec-field"><label>Questões corretas</label><input type="number" min="0" value={qCorrect} onChange={(e) => setQCorrect(e.target.value)} placeholder="0" /></div>
           </div>
           <div className="pec-hint">Tempo líquido calculado: <strong className="pec-mono">{minutesToLabel(netMinPreview)}</strong> (bruto {minutesToLabel(grossMinPreview)} − pausas {pause || 0}min)</div>
           <div style={{ marginTop: 12 }}><button className="pec-submit" type="submit"><Plus size={15} /> Registrar sessão</button></div>
@@ -960,7 +1121,7 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
           <div className="pec-empty">Nenhuma sessão registrada ainda.</div>
         ) : (
           <table className="pec-table">
-            <thead><tr><th>Data</th><th>Disciplina</th><th>Assunto</th><th>Bruto</th><th>Líquido</th><th>Questões</th><th></th></tr></thead>
+            <thead><tr><th>Data</th><th>Disciplina</th><th>Assunto</th><th>Bruto</th><th>Líquido</th><th></th></tr></thead>
             <tbody>
               {sessions.map((s) => {
                 const sub = subjectById[s.subjectId];
@@ -971,7 +1132,6 @@ function SessionsView({ subjects, topicsBySubject, sessions, onAdd, onRemove }) 
                     <td style={{ color: "#3B4A6B" }}>{s.topicId && topicNameById[s.topicId] ? topicNameById[s.topicId] : "—"}</td>
                     <td className="pec-mono">{minutesToLabel(s.grossMin)}</td>
                     <td className="pec-mono">{minutesToLabel(Math.max(0, s.grossMin - s.pauseMin))}</td>
-                    <td className="pec-mono">{s.qCorrect}/{s.qTotal}</td>
                     <td><button className="pec-del" onClick={() => onRemove(s.id)} aria-label="Remover sessão"><Trash2 size={13} /></button></td>
                   </tr>
                 );
@@ -991,7 +1151,7 @@ const STYLES = `
     --ink: #14213D; --ink-soft: #3B4A6B; --paper: #FAF8F3; --panel: #FFFFFF;
     --gold: #C89B3C; --green: #2F6F4E; --coral: #B33F3F; --line: #E1DACB;
     font-family: 'Inter', sans-serif; background: var(--paper); color: var(--ink);
-    height: 100vh; overflow: hidden; display: flex; border: none; border-radius: 0;
+    min-height: 600px; border-radius: 12px; overflow: hidden; display: flex; border: 1px solid var(--line);
   }
   .pec-serif { font-family: 'Space Grotesk', sans-serif; }
   .pec-mono { font-family: 'IBM Plex Mono', monospace; }
@@ -1004,7 +1164,7 @@ const STYLES = `
   .pec-navbtn:hover { background: rgba(237,231,214,0.08); color: #EDE7D6; }
   .pec-navbtn.active { background: rgba(200,155,60,0.16); color: var(--gold); }
 
-  .pec-main { flex: 1; padding: 28px 32px; overflow-y: auto; height: 100vh; }
+  .pec-main { flex: 1; padding: 28px 32px; overflow-y: auto; max-height: 780px; }
   .pec-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 22px; }
   .pec-title { font-family: 'Space Grotesk', sans-serif; font-size: 22px; font-weight: 600; }
   .pec-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }

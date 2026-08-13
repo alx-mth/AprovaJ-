@@ -143,6 +143,7 @@ function generateWeightedBlocks(subjectList, totalMinutes, blockMinutes) {
 
 export default function AprovaJa() {
   const [loaded, setLoaded] = useState(false);
+  const [loadBlocked, setLoadBlocked] = useState(false);
   const [subjects, setSubjects] = useState([]);
   const [topics, setTopics] = useState([]);
   const [questions, setQuestions] = useState([]);
@@ -154,48 +155,46 @@ export default function AprovaJa() {
   const [view, setView] = useState("dashboard");
 
   useEffect(() => {
-    (async () => {
-      try {
-        if (window.storage) {
-          let res = null;
-          try { res = await window.storage.get(STORAGE_KEY, false); } catch (e) { res = null; }
-          if (!res) {
-            try {
-              const legacy = await window.storage.get(LEGACY_KEY, false);
-              if (legacy && legacy.value) res = legacy;
-            } catch (e) { /* nothing */ }
-          }
-          if (res && res.value) {
-            const parsed = JSON.parse(res.value);
-            setSubjects(parsed.subjects || []);
-            setTopics(parsed.topics || []);
-            setQuestions(parsed.questions || []);
-            setQuestionLogs(parsed.questionLogs || []);
-            setSessions(parsed.sessions || []);
-            setCycleBlocks(parsed.cycleBlocks || []);
-            setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
-            setWeeklySchedule(parsed.weeklySchedule || emptyWeeklySchedule());
-          }
+    try {
+      let raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) raw = localStorage.getItem(LEGACY_KEY);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          setSubjects(parsed.subjects || []);
+          setTopics(parsed.topics || []);
+          setQuestions(parsed.questions || []);
+          setQuestionLogs(parsed.questionLogs || []);
+          setSessions(parsed.sessions || []);
+          setCycleBlocks(parsed.cycleBlocks || []);
+          setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
+          setWeeklySchedule(parsed.weeklySchedule || emptyWeeklySchedule());
+        } catch (parseErr) {
+          // Os dados existem mas não puderam ser lidos (formato inválido).
+          // Nunca sobrescrever silenciosamente: guarda uma cópia de segurança
+          // e avisa no console, em vez de deixar o próximo salvamento apagar
+          // o que estava lá.
+          console.error("AprovaJÁ: dados salvos existem mas não puderam ser lidos.", parseErr);
+          try { localStorage.setItem(STORAGE_KEY + "-backup-corrompido", raw); } catch (e2) { /* ignore */ }
+          setLoadBlocked(true);
         }
-      } catch (e) {
-        // sem dados salvos ainda
-      } finally {
-        setLoaded(true);
+      } else {
+        console.info("AprovaJÁ: nenhum dado salvo encontrado neste navegador ainda (primeiro uso, ou storage vazio).");
       }
-    })();
+    } catch (e) {
+      console.error("AprovaJÁ: erro inesperado ao acessar o localStorage.", e);
+    } finally {
+      setLoaded(true);
+    }
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
-    (async () => {
-      try {
-        if (window.storage) {
-          await window.storage.set(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule }), false);
-        }
-      } catch (e) {
-        console.error("Falha ao salvar dados", e);
-      }
-    })();
+    if (!loaded || loadBlocked) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule }));
+    } catch (e) {
+      console.error("Falha ao salvar dados", e);
+    }
   }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule, loaded]);
 
   const subjectById = useMemo(() => {
@@ -384,6 +383,14 @@ export default function AprovaJa() {
       </aside>
 
       <main className="pec-main">
+        {loadBlocked && (
+          <div className="pec-alert-banner">
+            <b>Atenção:</b> encontramos dados salvos neste navegador, mas eles não puderam ser lidos
+            corretamente. Para sua segurança, nada foi apagado — uma cópia ficou guardada em
+            <code> aprovaja-data-backup-corrompido</code> (visível em DevTools → Application → Local
+            Storage). Fale com o suporte antes de continuar usando, para não perder esse histórico.
+          </div>
+        )}
         {view === "dashboard" && <DashboardView totals={totals} subjectStats={subjectStats} sessions={sessions} questionLogs={questionLogs} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} setView={setView} />}
         {view === "subjects" && <SubjectsView subjectStats={subjectStats} topicsBySubject={topicsBySubject} onAdd={addSubject} onRemove={removeSubject} onAddTopic={addTopic} onRemoveTopic={removeTopic} />}
         {view === "cycle" && <StudyPlanView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} onGenerateCycle={generateCycle} weeklySchedule={weeklySchedule} onAddCronogramaBlock={addCronogramaBlock} onRemoveCronogramaBlock={removeCronogramaBlock} onMoveCronogramaBlock={moveCronogramaBlock} onCompleteCronograma={completeCronogramaBlock} onGenerateCronograma={generateCronograma} />}
@@ -477,7 +484,7 @@ function DashboardView({ totals, subjectStats, sessions, questionLogs, subjectBy
             <BarChart data={chartData} margin={{ left: -20, right: 8 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#E1DACB" vertical={false} />
               <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#3B4A6B" }} axisLine={{ stroke: "#E1DACB" }} tickLine={false} />
-              <YAxis tick={{ fontSize: 11, fill: "#3B4A6B" }} axisLine={false} tickLine={false} width={34} />
+              <YAxis tick={{ fontSize: 11, fill: "#3B4A6B" }} axisLine={false} tickLine={false} width={46} />
               <Tooltip formatter={(v) => [`${v}h`, "Líquido"]} contentStyle={{ borderRadius: 8, border: "1px solid #E1DACB", fontSize: 12, fontFamily: "Inter" }} />
               <Bar dataKey="horas" fill="#2F6F4E" radius={[4, 4, 0, 0]} />
             </BarChart>
@@ -1474,7 +1481,7 @@ const STYLES = `
     --ink: #14213D; --ink-soft: #3B4A6B; --paper: #FAF8F3; --panel: #FFFFFF;
     --gold: #C89B3C; --green: #2F6F4E; --coral: #B33F3F; --line: #E1DACB;
     font-family: 'Inter', sans-serif; background: var(--paper); color: var(--ink);
-    min-height: 600px; border-radius: 12px; overflow: hidden; display: flex; border: 1px solid var(--line);
+    height: 100vh; overflow: hidden; display: flex; border: none; border-radius: 0;
   }
   .pec-serif { font-family: 'Space Grotesk', sans-serif; }
   .pec-mono { font-family: 'IBM Plex Mono', monospace; }
@@ -1487,10 +1494,13 @@ const STYLES = `
   .pec-navbtn:hover { background: rgba(237,231,214,0.08); color: #EDE7D6; }
   .pec-navbtn.active { background: rgba(200,155,60,0.16); color: var(--gold); }
 
-  .pec-main { flex: 1; padding: 28px 32px; overflow-y: auto; max-height: 780px; }
+  .pec-main { flex: 1; padding: 28px 32px; overflow-y: auto; height: 100vh; }
   .pec-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 22px; }
   .pec-title { font-family: 'Space Grotesk', sans-serif; font-size: 22px; font-weight: 600; }
   .pec-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }
+
+  .pec-alert-banner { background: #FBEAEA; border: 1px solid rgba(179,63,63,0.4); color: #7A2A2A; border-radius: 8px; padding: 12px 16px; font-size: 12.5px; margin-bottom: 18px; line-height: 1.5; }
+  .pec-alert-banner code { background: rgba(179,63,63,0.12); padding: 1px 5px; border-radius: 4px; font-family: 'IBM Plex Mono', monospace; }
 
   .pec-period-filter { display: inline-flex; background: #EFEADE; border-radius: 8px; padding: 3px; gap: 2px; margin-bottom: 18px; }
   .pec-period-btn { border: none; background: transparent; padding: 7px 14px; border-radius: 6px; font-size: 12.5px; font-weight: 600; color: var(--ink-soft); cursor: pointer; }

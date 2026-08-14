@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import {
   LayoutDashboard, BookOpen, ClipboardList, Plus, Trash2, Layers,
   RotateCcw, Check, X as XIcon, ChevronDown, ChevronRight, Shuffle,
-  RefreshCw, ArrowUp, ArrowDown, SkipForward, PlayCircle, Target
+  RefreshCw, ArrowUp, ArrowDown, SkipForward, PlayCircle, Target, Pencil,
+  Timer, Pause, Settings2
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 
@@ -152,6 +153,11 @@ export default function AprovaJa() {
   const [cycleBlocks, setCycleBlocks] = useState([]);
   const [cyclePointer, setCyclePointer] = useState({ index: 0, round: 1 });
   const [weeklySchedule, setWeeklySchedule] = useState(emptyWeeklySchedule());
+  const [pomodoroSettings, setPomodoroSettings] = useState({ focusMin: 25, shortBreakMin: 5, longBreakMin: 15, cyclesBeforeLongBreak: 4 });
+  const [pomodoro, setPomodoro] = useState({
+    running: false, phase: "focus", secondsLeft: 25 * 60, cyclesCompleted: 0,
+    subjectId: "", topicId: "", focusSecondsElapsed: 0,
+  });
   const [view, setView] = useState("dashboard");
 
   useEffect(() => {
@@ -169,6 +175,7 @@ export default function AprovaJa() {
           setCycleBlocks(parsed.cycleBlocks || []);
           setCyclePointer(parsed.cyclePointer || { index: 0, round: 1 });
           setWeeklySchedule(parsed.weeklySchedule || emptyWeeklySchedule());
+          setPomodoroSettings(parsed.pomodoroSettings || { focusMin: 25, shortBreakMin: 5, longBreakMin: 15, cyclesBeforeLongBreak: 4 });
         } catch (parseErr) {
           // Os dados existem mas não puderam ser lidos (formato inválido).
           // Nunca sobrescrever silenciosamente: guarda uma cópia de segurança
@@ -191,11 +198,11 @@ export default function AprovaJa() {
   useEffect(() => {
     if (!loaded || loadBlocked) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule, pomodoroSettings }));
     } catch (e) {
       console.error("Falha ao salvar dados", e);
     }
-  }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule, loaded]);
+  }, [subjects, topics, questions, questionLogs, sessions, cycleBlocks, cyclePointer, weeklySchedule, pomodoroSettings, loaded]);
 
   const subjectById = useMemo(() => {
     const map = {};
@@ -244,6 +251,9 @@ export default function AprovaJa() {
   }, [subjects, sessions, questionLogs, topicsBySubject, questions]);
 
   function addSubject(sub) { setSubjects((prev) => [...prev, { id: uid(), ...sub }]); }
+  function updateSubject(id, patch) {
+    setSubjects((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  }
   function removeSubject(id) {
     setSubjects((prev) => prev.filter((s) => s.id !== id));
     setTopics((prev) => prev.filter((t) => t.subjectId !== id));
@@ -356,10 +366,88 @@ export default function AprovaJa() {
     setWeeklySchedule(next);
   }
 
+  // ---------- Pomodoro ----------
+  useEffect(() => {
+    if (!loaded) return;
+    setPomodoro((prev) => (!prev.running && prev.focusSecondsElapsed === 0 && prev.phase === "focus"
+      ? { ...prev, secondsLeft: pomodoroSettings.focusMin * 60 }
+      : prev));
+  }, [loaded, pomodoroSettings.focusMin]);
+
+  function logFocusSeconds(seconds, subjectId, topicId) {
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 1 || !subjectId) return;
+    addSession({
+      subjectId, topicId: topicId || "", date: todayISO(),
+      grossMin: minutes, pauseMin: 0, fromPomodoro: true,
+    });
+  }
+
+  useEffect(() => {
+    if (!pomodoro.running) return;
+    const interval = setInterval(() => {
+      setPomodoro((prev) => {
+        if (!prev.running) return prev;
+        if (prev.secondsLeft > 1) {
+          const nextFocusElapsed = prev.phase === "focus" ? prev.focusSecondsElapsed + 1 : prev.focusSecondsElapsed;
+          return { ...prev, secondsLeft: prev.secondsLeft - 1, focusSecondsElapsed: nextFocusElapsed };
+        }
+        // phase finished naturally
+        if (prev.phase === "focus") {
+          logFocusSeconds(prev.focusSecondsElapsed + 1, prev.subjectId, prev.topicId);
+          const nextCycles = prev.cyclesCompleted + 1;
+          const goLong = nextCycles % pomodoroSettings.cyclesBeforeLongBreak === 0;
+          const nextPhase = goLong ? "long" : "short";
+          const nextSeconds = (goLong ? pomodoroSettings.longBreakMin : pomodoroSettings.shortBreakMin) * 60;
+          return { ...prev, phase: nextPhase, secondsLeft: nextSeconds, cyclesCompleted: nextCycles, focusSecondsElapsed: 0 };
+        }
+        return { ...prev, phase: "focus", secondsLeft: pomodoroSettings.focusMin * 60, focusSecondsElapsed: 0 };
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [pomodoro.running, pomodoroSettings]);
+
+  function startPomodoro(subjectId, topicId) {
+    setPomodoro((prev) => ({
+      ...prev,
+      running: true,
+      subjectId: subjectId !== undefined ? subjectId : prev.subjectId,
+      topicId: topicId !== undefined ? topicId : prev.topicId,
+      secondsLeft: prev.secondsLeft || pomodoroSettings.focusMin * 60,
+    }));
+  }
+  function pausePomodoro() { setPomodoro((prev) => ({ ...prev, running: false })); }
+  function resetPomodoro() {
+    setPomodoro((prev) => {
+      if (prev.phase === "focus" && prev.focusSecondsElapsed >= 60) logFocusSeconds(prev.focusSecondsElapsed, prev.subjectId, prev.topicId);
+      return { ...prev, running: false, phase: "focus", secondsLeft: pomodoroSettings.focusMin * 60, cyclesCompleted: 0, focusSecondsElapsed: 0 };
+    });
+  }
+  function skipPomodoroPhase() {
+    setPomodoro((prev) => {
+      if (prev.phase === "focus") {
+        logFocusSeconds(prev.focusSecondsElapsed, prev.subjectId, prev.topicId);
+        const nextCycles = prev.cyclesCompleted + 1;
+        const goLong = nextCycles % pomodoroSettings.cyclesBeforeLongBreak === 0;
+        const nextPhase = goLong ? "long" : "short";
+        return { ...prev, phase: nextPhase, secondsLeft: (goLong ? pomodoroSettings.longBreakMin : pomodoroSettings.shortBreakMin) * 60, cyclesCompleted: nextCycles, focusSecondsElapsed: 0 };
+      }
+      return { ...prev, phase: "focus", secondsLeft: pomodoroSettings.focusMin * 60, focusSecondsElapsed: 0 };
+    });
+  }
+  function setPomodoroSubject(subjectId, topicId) {
+    setPomodoro((prev) => ({ ...prev, subjectId, topicId: topicId || "" }));
+  }
+  function updatePomodoroSettings(next) {
+    setPomodoroSettings(next);
+    setPomodoro((prev) => (prev.running ? prev : { ...prev, secondsLeft: next.focusMin * 60, phase: "focus", focusSecondsElapsed: 0 }));
+  }
+
   const NAV = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "subjects", label: "Disciplinas", icon: BookOpen },
     { key: "cycle", label: "Ciclo / Cronograma", icon: RefreshCw },
+    { key: "pomodoro", label: "Pomodoro", icon: Timer },
     { key: "quantitativo", label: "Quantitativo", icon: Target },
     { key: "questions", label: "Questões", icon: Layers },
     { key: "review", label: "Revisão", icon: RotateCcw },
@@ -392,8 +480,9 @@ export default function AprovaJa() {
           </div>
         )}
         {view === "dashboard" && <DashboardView totals={totals} subjectStats={subjectStats} sessions={sessions} questionLogs={questionLogs} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} setView={setView} />}
-        {view === "subjects" && <SubjectsView subjectStats={subjectStats} topicsBySubject={topicsBySubject} onAdd={addSubject} onRemove={removeSubject} onAddTopic={addTopic} onRemoveTopic={removeTopic} />}
+        {view === "subjects" && <SubjectsView subjectStats={subjectStats} topicsBySubject={topicsBySubject} onAdd={addSubject} onUpdate={updateSubject} onRemove={removeSubject} onAddTopic={addTopic} onRemoveTopic={removeTopic} />}
         {view === "cycle" && <StudyPlanView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} onGenerateCycle={generateCycle} weeklySchedule={weeklySchedule} onAddCronogramaBlock={addCronogramaBlock} onRemoveCronogramaBlock={removeCronogramaBlock} onMoveCronogramaBlock={moveCronogramaBlock} onCompleteCronograma={completeCronogramaBlock} onGenerateCronograma={generateCronograma} />}
+        {view === "pomodoro" && <PomodoroView subjects={subjects} subjectById={subjectById} topicsBySubject={topicsBySubject} sessions={sessions} pomodoro={pomodoro} settings={pomodoroSettings} onStart={startPomodoro} onPause={pausePomodoro} onReset={resetPomodoro} onSkip={skipPomodoroPhase} onSetSubject={setPomodoroSubject} onUpdateSettings={updatePomodoroSettings} />}
         {view === "quantitativo" && <QuantitativoView subjects={subjects} topicsBySubject={topicsBySubject} questionLogs={questionLogs} onAdd={addQuestionLog} onRemove={removeQuestionLog} />}
         {view === "questions" && <QuestionsView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onAdd={addQuestion} onRemove={removeQuestion} />}
         {view === "review" && <ReviewView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onResult={registerReview} />}
@@ -582,13 +671,18 @@ function Header({ title, sub }) {
 }
 
 /* ---------------- DISCIPLINAS + ASSUNTOS ---------------- */
-function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTopic, onRemoveTopic }) {
+function SubjectsView({ subjectStats, topicsBySubject, onAdd, onUpdate, onRemove, onAddTopic, onRemoveTopic }) {
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
   const [color, setColor] = useState(PALETTE[0]);
   const [priority, setPriority] = useState("2");
   const [expanded, setExpanded] = useState(null);
   const [topicDraft, setTopicDraft] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [editGoal, setEditGoal] = useState("");
+  const [editPriority, setEditPriority] = useState("2");
+  const [editColor, setEditColor] = useState(PALETTE[0]);
 
   function submit(e) {
     e.preventDefault();
@@ -602,6 +696,22 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTop
     if (!topicDraft.trim()) return;
     onAddTopic(subjectId, topicDraft.trim());
     setTopicDraft("");
+  }
+
+  function startEdit(s) {
+    setEditingId(s.id);
+    setEditName(s.name);
+    setEditGoal(String(s.goal || 0));
+    setEditPriority(String(s.priority || 2));
+    setEditColor(s.color);
+    setExpanded(s.id);
+  }
+  function cancelEdit() { setEditingId(null); }
+  function saveEdit(e, id) {
+    e.preventDefault();
+    if (!editName.trim()) return;
+    onUpdate(id, { name: editName.trim(), goal: Number(editGoal) || 0, priority: Number(editPriority), color: editColor });
+    setEditingId(null);
   }
 
   return (
@@ -644,27 +754,67 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onRemove, onAddTop
       ) : (
         subjectStats.map((s) => {
           const isOpen = expanded === s.id;
+          const isEditing = editingId === s.id;
           const subTopics = topicsBySubject[s.id] || [];
           return (
             <div className="pec-panel" key={s.id} style={{ marginBottom: 14 }}>
-              <div className="pec-subject-head" onClick={() => setExpanded(isOpen ? null : s.id)}>
+              <div className="pec-subject-head" onClick={() => !isEditing && setExpanded(isOpen ? null : s.id)}>
                 <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
                   {isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                   <span className="pec-dot" style={{ background: s.color, width: 11, height: 11 }} />
                   <span className="pec-card-name">{s.name}</span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-                  <span className={`pec-tag ${s.priority === 3 ? "gold" : ""}`}>{s.priority === 3 ? "Alta" : s.priority === 1 ? "Baixa" : "Média"} prioridade</span>
-                  <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{subTopics.length} assunto{subTopics.length !== 1 ? "s" : ""}</span>
-                  <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{s.qDone}/{s.goal || 0} questões</span>
-                  <button className="pec-del" onClick={(e) => { e.stopPropagation(); onRemove(s.id); }} aria-label={`Remover ${s.name}`}><Trash2 size={14} /></button>
-                </div>
-              </div>
-              <div className="pec-bar-track" style={{ marginTop: 10, marginBottom: isOpen ? 16 : 0 }}>
-                <div className="pec-bar-fill" style={{ width: `${s.goal > 0 ? Math.min(100, (s.qDone / s.goal) * 100) : 0}%`, background: s.color }} />
+                {!isEditing && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                    <span className={`pec-tag ${s.priority === 3 ? "gold" : ""}`}>{s.priority === 3 ? "Alta" : s.priority === 1 ? "Baixa" : "Média"} prioridade</span>
+                    <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{subTopics.length} assunto{subTopics.length !== 1 ? "s" : ""}</span>
+                    <span className="pec-mono" style={{ fontSize: 12, color: "#3B4A6B" }}>{s.qDone}/{s.goal || 0} questões</span>
+                    <button className="pec-del" onClick={(e) => { e.stopPropagation(); startEdit(s); }} aria-label={`Editar ${s.name}`}><Pencil size={14} /></button>
+                    <button className="pec-del" onClick={(e) => { e.stopPropagation(); onRemove(s.id); }} aria-label={`Remover ${s.name}`}><Trash2 size={14} /></button>
+                  </div>
+                )}
               </div>
 
-              {isOpen && (
+              {!isEditing && (
+                <div className="pec-bar-track" style={{ marginTop: 10, marginBottom: isOpen ? 16 : 0 }}>
+                  <div className="pec-bar-fill" style={{ width: `${s.goal > 0 ? Math.min(100, (s.qDone / s.goal) * 100) : 0}%`, background: s.color }} />
+                </div>
+              )}
+
+              {isEditing && (
+                <form className="pec-field-grid" onSubmit={(e) => saveEdit(e, s.id)} style={{ marginTop: 14, alignItems: "end" }}>
+                  <div className="pec-field">
+                    <label>Nome da disciplina</label>
+                    <input value={editName} onChange={(e) => setEditName(e.target.value)} />
+                  </div>
+                  <div className="pec-field">
+                    <label>Meta de questões</label>
+                    <input type="number" min="0" value={editGoal} onChange={(e) => setEditGoal(e.target.value)} />
+                  </div>
+                  <div className="pec-field">
+                    <label>Prioridade</label>
+                    <select value={editPriority} onChange={(e) => setEditPriority(e.target.value)}>
+                      <option value="1">Baixa</option>
+                      <option value="2">Média</option>
+                      <option value="3">Alta</option>
+                    </select>
+                  </div>
+                  <div className="pec-field">
+                    <label>Cor</label>
+                    <div className="pec-colorpick">
+                      {PALETTE.map((c) => (
+                        <button type="button" key={c} className={`pec-swatch ${editColor === c ? "selected" : ""}`} style={{ background: c }} onClick={() => setEditColor(c)} aria-label={`Selecionar cor ${c}`} />
+                      ))}
+                    </div>
+                  </div>
+                  <div className="pec-field" style={{ display: "flex", gap: 8 }}>
+                    <button className="pec-submit" type="submit"><Check size={14} /> Salvar</button>
+                    <button className="pec-submit small" type="button" style={{ background: "#8A8370" }} onClick={cancelEdit}><XIcon size={13} /> Cancelar</button>
+                  </div>
+                </form>
+              )}
+
+              {isOpen && !isEditing && (
                 <div className="pec-topics">
                   {subTopics.length === 0 ? (
                     <div className="pec-empty" style={{ padding: "10px 0" }}>Nenhum assunto cadastrado nesta disciplina ainda.</div>
@@ -1279,6 +1429,140 @@ function StudyPlanView({
   );
 }
 
+/* ---------------- POMODORO ---------------- */
+function formatClock(totalSeconds) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function PomodoroView({ subjects, subjectById, topicsBySubject, sessions, pomodoro, settings, onStart, onPause, onReset, onSkip, onSetSubject, onUpdateSettings }) {
+  const [showSettings, setShowSettings] = useState(false);
+  const [draftSettings, setDraftSettings] = useState(settings);
+
+  useEffect(() => { setDraftSettings(settings); }, [settings]);
+
+  const subjectTopics = topicsBySubject[pomodoro.subjectId] || [];
+  const today = todayISO();
+  const todaysPomodoros = useMemo(
+    () => sessions.filter((s) => s.fromPomodoro && s.date === today),
+    [sessions, today]
+  );
+  const todaysFocusMin = todaysPomodoros.reduce((a, s) => a + s.grossMin, 0);
+  const history = useMemo(() => sessions.filter((s) => s.fromPomodoro).slice(0, 12), [sessions]);
+
+  const phaseLabel = pomodoro.phase === "focus" ? "Foco" : pomodoro.phase === "long" ? "Pausa longa" : "Pausa curta";
+  const phaseColor = pomodoro.phase === "focus" ? "var(--gold)" : "var(--green)";
+  const totalPhaseSeconds = (pomodoro.phase === "focus" ? settings.focusMin : pomodoro.phase === "long" ? settings.longBreakMin : settings.shortBreakMin) * 60;
+  const progressPct = totalPhaseSeconds > 0 ? ((totalPhaseSeconds - pomodoro.secondsLeft) / totalPhaseSeconds) * 100 : 0;
+
+  function saveSettings(e) {
+    e.preventDefault();
+    onUpdateSettings({
+      focusMin: Math.max(1, Number(draftSettings.focusMin) || 25),
+      shortBreakMin: Math.max(1, Number(draftSettings.shortBreakMin) || 5),
+      longBreakMin: Math.max(1, Number(draftSettings.longBreakMin) || 15),
+      cyclesBeforeLongBreak: Math.max(2, Number(draftSettings.cyclesBeforeLongBreak) || 4),
+    });
+    setShowSettings(false);
+  }
+
+  const dots = Array.from({ length: settings.cyclesBeforeLongBreak }, (_, i) => i < pomodoro.cyclesCompleted % settings.cyclesBeforeLongBreak || (pomodoro.cyclesCompleted > 0 && pomodoro.cyclesCompleted % settings.cyclesBeforeLongBreak === 0 && i < settings.cyclesBeforeLongBreak));
+
+  return (
+    <>
+      <Header title="Pomodoro" sub="Estude em blocos de foco cronometrados — o tempo conta automaticamente nas horas da disciplina" />
+
+      <div className="pec-panel">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ marginBottom: 0 }}>Configuração</h3>
+          <button className="pec-submit small" onClick={() => setShowSettings((v) => !v)} disabled={pomodoro.running}>
+            <Settings2 size={13} /> {showSettings ? "Fechar" : "Ajustar tempos"}
+          </button>
+        </div>
+        {pomodoro.running && <div className="pec-hint" style={{ marginTop: 6 }}>Pause o pomodoro para poder ajustar os tempos.</div>}
+        {showSettings && !pomodoro.running && (
+          <form className="pec-field-grid" onSubmit={saveSettings} style={{ marginTop: 14, alignItems: "end" }}>
+            <div className="pec-field"><label>Foco (min)</label><input type="number" min="1" value={draftSettings.focusMin} onChange={(e) => setDraftSettings({ ...draftSettings, focusMin: e.target.value })} /></div>
+            <div className="pec-field"><label>Pausa curta (min)</label><input type="number" min="1" value={draftSettings.shortBreakMin} onChange={(e) => setDraftSettings({ ...draftSettings, shortBreakMin: e.target.value })} /></div>
+            <div className="pec-field"><label>Pausa longa (min)</label><input type="number" min="1" value={draftSettings.longBreakMin} onChange={(e) => setDraftSettings({ ...draftSettings, longBreakMin: e.target.value })} /></div>
+            <div className="pec-field"><label>Ciclos até pausa longa</label><input type="number" min="2" value={draftSettings.cyclesBeforeLongBreak} onChange={(e) => setDraftSettings({ ...draftSettings, cyclesBeforeLongBreak: e.target.value })} /></div>
+            <div className="pec-field"><button className="pec-submit" type="submit"><Check size={14} /> Salvar</button></div>
+          </form>
+        )}
+      </div>
+
+      <div className="pec-panel pec-pomodoro-card">
+        <div className="pec-pomodoro-phase" style={{ color: phaseColor }}>{phaseLabel}</div>
+        <div className="pec-pomodoro-clock">{formatClock(pomodoro.secondsLeft)}</div>
+        <div className="pec-bar-track" style={{ maxWidth: 360, margin: "0 auto 18px" }}>
+          <div className="pec-bar-fill" style={{ width: `${progressPct}%`, background: phaseColor }} />
+        </div>
+
+        <div className="pec-pomodoro-dots">
+          {dots.map((filled, i) => <span key={i} className={`pec-dot-cycle ${filled ? "filled" : ""}`} />)}
+        </div>
+
+        <div className="pec-field-grid" style={{ maxWidth: 480, margin: "18px auto 10px" }}>
+          <div className="pec-field">
+            <label>Disciplina</label>
+            <select value={pomodoro.subjectId} onChange={(e) => onSetSubject(e.target.value, "")} disabled={pomodoro.running || subjects.length === 0}>
+              <option value="">Selecione</option>
+              {subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </div>
+          <div className="pec-field">
+            <label>Assunto (opcional)</label>
+            <select value={pomodoro.topicId} onChange={(e) => onSetSubject(pomodoro.subjectId, e.target.value)} disabled={pomodoro.running || !pomodoro.subjectId}>
+              <option value="">Geral</option>
+              {subjectTopics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="pec-review-actions" style={{ justifyContent: "center", marginTop: 10 }}>
+          {!pomodoro.running ? (
+            <button className="pec-submit" onClick={() => onStart()} disabled={!pomodoro.subjectId}><PlayCircle size={16} /> {pomodoro.secondsLeft < totalPhaseSeconds ? "Continuar" : "Iniciar"}</button>
+          ) : (
+            <button className="pec-submit" onClick={onPause}><Pause size={16} /> Pausar</button>
+          )}
+          <button className="pec-submit small" style={{ background: "#8A8370" }} onClick={onSkip}><SkipForward size={14} /> Pular fase</button>
+          <button className="pec-submit small" style={{ background: "#8A8370" }} onClick={onReset}><RotateCcw size={14} /> Reiniciar</button>
+        </div>
+        {!pomodoro.subjectId && <div className="pec-hint" style={{ marginTop: 10 }}>Escolha uma disciplina para poder iniciar.</div>}
+      </div>
+
+      <div className="pec-hero" style={{ gridTemplateColumns: "1fr 1fr", padding: "16px 22px" }}>
+        <LedgerItem label="Pomodoros hoje" value={todaysPomodoros.length} sub="blocos de foco concluídos" />
+        <LedgerItem label="Tempo focado hoje" value={minutesToLabel(todaysFocusMin)} sub="somado às horas da disciplina" cls="green" />
+      </div>
+
+      <div className="pec-panel">
+        <h3>Histórico do Pomodoro</h3>
+        {history.length === 0 ? (
+          <div className="pec-empty">Seus blocos de foco concluídos vão aparecer aqui.</div>
+        ) : (
+          <table className="pec-table">
+            <thead><tr><th>Data</th><th>Disciplina</th><th>Tempo focado</th></tr></thead>
+            <tbody>
+              {history.map((s) => {
+                const sub = subjectById[s.subjectId];
+                return (
+                  <tr key={s.id}>
+                    <td className="pec-mono">{formatDateShort(s.date)}</td>
+                    <td><span className="pec-dot" style={{ background: sub ? sub.color : "#999", marginRight: 6, display: "inline-block" }} />{sub ? sub.name : "Disciplina removida"}</td>
+                    <td className="pec-mono">{minutesToLabel(s.grossMin)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
 /* ---------------- QUANTITATIVO DE QUESTÕES ---------------- */
 function QuantitativoView({ subjects, topicsBySubject, questionLogs, onAdd, onRemove }) {
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
@@ -1575,6 +1859,13 @@ const STYLES = `
   .pec-tag.gold { background: rgba(200,155,60,0.18); color: var(--gold); }
   .pec-qtext { font-size: 13px; line-height: 1.5; padding-right: 26px; }
   .pec-qdel { position: absolute; top: 10px; right: 10px; }
+
+  .pec-pomodoro-card { text-align: center; padding: 30px 22px; }
+  .pec-pomodoro-phase { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 8px; }
+  .pec-pomodoro-clock { font-family: 'IBM Plex Mono', monospace; font-size: 56px; font-weight: 600; color: var(--ink); line-height: 1; margin-bottom: 18px; }
+  .pec-pomodoro-dots { display: flex; justify-content: center; gap: 8px; margin-bottom: 4px; }
+  .pec-dot-cycle { width: 10px; height: 10px; border-radius: 50%; background: #EFEADE; border: 1px solid var(--line); }
+  .pec-dot-cycle.filled { background: var(--gold); border-color: var(--gold); }
 
   .pec-cycle-current { }
   .pec-cycle-current-info { display: flex; align-items: center; gap: 12px; }

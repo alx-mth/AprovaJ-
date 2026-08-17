@@ -267,6 +267,55 @@ export default function AprovaJa() {
   }
   function addQuestion(q) { setQuestions((prev) => [{ id: uid(), timesReviewed: 0, timesCorrect: 0, ...q }, ...prev]); }
   function removeQuestion(id) { setQuestions((prev) => prev.filter((q) => q.id !== id)); }
+  function importQuestions(items) {
+    let nextSubjects = [...subjects];
+    let nextTopics = [...topics];
+    const newQuestions = [];
+
+    items.forEach((item) => {
+      const discName = (item.disciplina || "").trim();
+      if (!discName) return;
+      let subject = nextSubjects.find((s) => s.name.trim().toLowerCase() === discName.toLowerCase());
+      if (!subject) {
+        subject = { id: uid(), name: discName, goal: 0, color: PALETTE[nextSubjects.length % PALETTE.length], priority: 2 };
+        nextSubjects = [...nextSubjects, subject];
+      }
+
+      let topic = null;
+      const topicName = (item.assunto || "").trim();
+      if (topicName) {
+        topic = nextTopics.find((t) => t.subjectId === subject.id && t.name.trim().toLowerCase() === topicName.toLowerCase());
+        if (!topic) {
+          topic = { id: uid(), subjectId: subject.id, name: topicName };
+          nextTopics = [...nextTopics, topic];
+        }
+      }
+
+      const isMultipla = item.tipo === "multipla" && Array.isArray(item.alternativas) && item.alternativas.length > 0;
+      newQuestions.push({
+        id: uid(),
+        subjectId: subject.id,
+        topicId: topic ? topic.id : "",
+        statement: (item.enunciado || "").trim(),
+        answer: isMultipla ? "" : (item.resposta || "").trim(),
+        type: isMultipla ? "multipla" : "texto",
+        alternatives: isMultipla ? item.alternativas.map((a) => ({ letter: a.letra, text: a.texto })) : [],
+        correctLetter: isMultipla ? (item.correta || "") : "",
+        numero: (item.numero || "").toString().trim(),
+        banca: (item.banca || "").trim(),
+        ano: (item.ano || "").toString().trim(),
+        concurso: (item.concurso || "").trim(),
+        timesReviewed: 0,
+        timesCorrect: 0,
+      });
+    });
+
+    if (newQuestions.length === 0) return 0;
+    setSubjects(nextSubjects);
+    setTopics(nextTopics);
+    setQuestions((prev) => [...newQuestions, ...prev]);
+    return newQuestions.length;
+  }
   function registerReview(id, correct) {
     setQuestions((prev) => prev.map((q) => q.id === id
       ? { ...q, timesReviewed: (q.timesReviewed || 0) + 1, timesCorrect: (q.timesCorrect || 0) + (correct ? 1 : 0) }
@@ -484,7 +533,7 @@ export default function AprovaJa() {
         {view === "cycle" && <StudyPlanView subjects={subjects} subjectById={subjectById} cycleBlocks={cycleBlocks} cyclePointer={cyclePointer} sessions={sessions} onAddBlock={addCycleBlock} onRemoveBlock={removeCycleBlock} onMoveBlock={moveCycleBlock} onComplete={completeCycleBlock} onSkip={skipCycleBlock} onReset={resetCycle} onGenerateCycle={generateCycle} weeklySchedule={weeklySchedule} onAddCronogramaBlock={addCronogramaBlock} onRemoveCronogramaBlock={removeCronogramaBlock} onMoveCronogramaBlock={moveCronogramaBlock} onCompleteCronograma={completeCronogramaBlock} onGenerateCronograma={generateCronograma} />}
         {view === "pomodoro" && <PomodoroView subjects={subjects} subjectById={subjectById} topicsBySubject={topicsBySubject} sessions={sessions} pomodoro={pomodoro} settings={pomodoroSettings} onStart={startPomodoro} onPause={pausePomodoro} onReset={resetPomodoro} onSkip={skipPomodoroPhase} onSetSubject={setPomodoroSubject} onUpdateSettings={updatePomodoroSettings} />}
         {view === "quantitativo" && <QuantitativoView subjects={subjects} topicsBySubject={topicsBySubject} questionLogs={questionLogs} onAdd={addQuestionLog} onRemove={removeQuestionLog} />}
-        {view === "questions" && <QuestionsView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onAdd={addQuestion} onRemove={removeQuestion} />}
+        {view === "questions" && <QuestionsView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onAdd={addQuestion} onRemove={removeQuestion} onImport={importQuestions} />}
         {view === "review" && <ReviewView subjects={subjects} topicsBySubject={topicsBySubject} questions={questions} onResult={registerReview} />}
         {view === "sessions" && <SessionsView subjects={subjects} topicsBySubject={topicsBySubject} sessions={sessions} onAdd={addSession} onRemove={removeSession} />}
       </main>
@@ -843,11 +892,88 @@ function SubjectsView({ subjectStats, topicsBySubject, onAdd, onUpdate, onRemove
 }
 
 /* ---------------- QUESTÕES (BANCO DE FLASHCARDS) ---------------- */
-function QuestionsView({ subjects, topicsBySubject, questions, onAdd, onRemove }) {
+function ImportPanel({ onImport }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [feedback, setFeedback] = useState(null);
+
+  function handleImport() {
+    let items;
+    try {
+      items = JSON.parse(text);
+      if (!Array.isArray(items)) throw new Error("precisa ser uma lista");
+    } catch (e) {
+      setFeedback({ ok: false, msg: "Não consegui ler esse conteúdo como JSON válido. Confira se copiou tudo, incluindo os colchetes [ ] do início e do fim." });
+      return;
+    }
+    const count = onImport(items);
+    setFeedback({ ok: true, msg: `${count} questão${count !== 1 ? "ões" : ""} importada${count !== 1 ? "s" : ""} com sucesso.` });
+    setText("");
+  }
+
+  return (
+    <div className="pec-panel">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ marginBottom: 0 }}>Importar questões em lote</h3>
+        <button className="pec-submit small" onClick={() => setOpen((v) => !v)}>{open ? "Fechar" : "Importar em lote"}</button>
+      </div>
+      {open && (
+        <div style={{ marginTop: 16 }}>
+          <p style={{ fontSize: 12.5, color: "var(--ink-soft)", marginBottom: 10 }}>
+            Cole aqui uma lista de questões em JSON — o jeito mais fácil é me enviar um PDF de
+            questões numa conversa com o Claude e pedir para extrair nesse formato. Disciplinas e
+            assuntos citados que ainda não existirem no sistema são criados automaticamente.
+          </p>
+          <details style={{ marginBottom: 10 }}>
+            <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--ink-soft)" }}>Ver formato esperado</summary>
+            <pre style={{ fontSize: 10.5, background: "#FAF8F3", padding: 10, borderRadius: 6, overflowX: "auto", marginTop: 6 }}>{`[
+  {
+    "disciplina": "Direito Constitucional",
+    "assunto": "Controle de Constitucionalidade",
+    "numero": "45",
+    "banca": "CESPE/Cebraspe",
+    "ano": "2023",
+    "concurso": "TRT 10ª Região",
+    "enunciado": "Texto da questão...",
+    "tipo": "multipla",
+    "alternativas": [
+      { "letra": "A", "texto": "..." },
+      { "letra": "B", "texto": "..." },
+      { "letra": "C", "texto": "..." }
+    ],
+    "correta": "C"
+  },
+  {
+    "disciplina": "Português",
+    "enunciado": "Texto da questão discursiva...",
+    "resposta": "Resposta/gabarito...",
+    "tipo": "texto"
+  }
+]`}</pre>
+          </details>
+          <textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Cole aqui o JSON com as questões..." style={{ width: "100%", border: "1px solid var(--line)", borderRadius: 6, padding: "8px 10px", fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", background: "#FFFDF9", color: "var(--ink)" }} />
+          {feedback && (
+            <div className="pec-hint" style={{ marginTop: 8, color: feedback.ok ? "var(--green)" : "var(--coral)" }}>{feedback.msg}</div>
+          )}
+          <button className="pec-submit" onClick={handleImport} style={{ marginTop: 10 }}><Plus size={15} /> Importar questões</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QuestionsView({ subjects, topicsBySubject, questions, onAdd, onRemove, onImport }) {
   const [subjectId, setSubjectId] = useState(subjects[0]?.id || "");
   const [topicId, setTopicId] = useState("");
   const [statement, setStatement] = useState("");
   const [answer, setAnswer] = useState("");
+  const [tipo, setTipo] = useState("texto");
+  const [alternatives, setAlternatives] = useState([{ letter: "A", text: "" }, { letter: "B", text: "" }, { letter: "C", text: "" }]);
+  const [correctLetter, setCorrectLetter] = useState("A");
+  const [numero, setNumero] = useState("");
+  const [banca, setBanca] = useState("");
+  const [ano, setAno] = useState("");
+  const [concurso, setConcurso] = useState("");
   const [filterSubject, setFilterSubject] = useState("");
 
   useEffect(() => { if (!subjectId && subjects.length > 0) setSubjectId(subjects[0].id); }, [subjects, subjectId]);
@@ -857,18 +983,45 @@ function QuestionsView({ subjects, topicsBySubject, questions, onAdd, onRemove }
   const subjectById = useMemo(() => { const m = {}; subjects.forEach((s) => (m[s.id] = s)); return m; }, [subjects]);
   const topicNameById = useMemo(() => { const m = {}; Object.values(topicsBySubject).flat().forEach((t) => (m[t.id] = t.name)); return m; }, [topicsBySubject]);
 
+  function updateAlternative(letter, text) {
+    setAlternatives((prev) => prev.map((a) => (a.letter === letter ? { ...a, text } : a)));
+  }
+  function addAlternative() {
+    if (alternatives.length >= 5) return;
+    const nextLetter = String.fromCharCode(65 + alternatives.length);
+    setAlternatives((prev) => [...prev, { letter: nextLetter, text: "" }]);
+  }
+  function removeAlternative(letter) {
+    if (alternatives.length <= 2) return;
+    const remaining = alternatives.filter((a) => a.letter !== letter);
+    setAlternatives(remaining);
+    if (correctLetter === letter) setCorrectLetter(remaining[0].letter);
+  }
+
   function submit(e) {
     e.preventDefault();
-    if (!subjectId || !statement.trim() || !answer.trim()) return;
-    onAdd({ subjectId, topicId: topicId || "", statement: statement.trim(), answer: answer.trim() });
-    setStatement(""); setAnswer("");
+    if (!subjectId || !statement.trim()) return;
+    const isMultipla = tipo === "multipla";
+    if (isMultipla && alternatives.some((a) => !a.text.trim())) return;
+    if (!isMultipla && !answer.trim()) return;
+    onAdd({
+      subjectId, topicId: topicId || "", statement: statement.trim(),
+      answer: isMultipla ? "" : answer.trim(),
+      type: tipo,
+      alternatives: isMultipla ? alternatives : [],
+      correctLetter: isMultipla ? correctLetter : "",
+      numero: numero.trim(), banca: banca.trim(), ano: ano.trim(), concurso: concurso.trim(),
+    });
+    setStatement(""); setAnswer(""); setNumero(""); setBanca(""); setAno(""); setConcurso("");
+    setAlternatives([{ letter: "A", text: "" }, { letter: "B", text: "" }, { letter: "C", text: "" }]);
+    setCorrectLetter("A");
   }
 
   const filtered = filterSubject ? questions.filter((q) => q.subjectId === filterSubject) : questions;
 
   return (
     <>
-      <Header title="Questões" sub="Cadastre questões e enunciados para virarem flashcards de revisão" />
+      <Header title="Questões" sub="Cadastre questões (discursivas ou de múltipla escolha) para virarem flashcards de revisão" />
 
       {subjects.length === 0 ? (
         <div className="pec-panel"><div className="pec-empty">Cadastre uma disciplina antes de adicionar questões.</div></div>
@@ -889,18 +1042,55 @@ function QuestionsView({ subjects, topicsBySubject, questions, onAdd, onRemove }
                 {subjectTopics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
             </div>
+            <div className="pec-field">
+              <label>Tipo de questão</label>
+              <select value={tipo} onChange={(e) => setTipo(e.target.value)}>
+                <option value="texto">Discursiva / flashcard</option>
+                <option value="multipla">Múltipla escolha</option>
+              </select>
+            </div>
           </div>
+
+          <div className="pec-field-grid">
+            <div className="pec-field"><label>Número da questão</label><input value={numero} onChange={(e) => setNumero(e.target.value)} placeholder="Ex: 45" /></div>
+            <div className="pec-field"><label>Banca organizadora</label><input value={banca} onChange={(e) => setBanca(e.target.value)} placeholder="Ex: CESPE/Cebraspe" /></div>
+            <div className="pec-field"><label>Ano</label><input value={ano} onChange={(e) => setAno(e.target.value)} placeholder="Ex: 2023" /></div>
+            <div className="pec-field"><label>Concurso</label><input value={concurso} onChange={(e) => setConcurso(e.target.value)} placeholder="Ex: TRT 10ª Região" /></div>
+          </div>
+
           <div className="pec-field" style={{ marginBottom: 12 }}>
             <label>Enunciado da questão</label>
             <textarea rows={3} value={statement} onChange={(e) => setStatement(e.target.value)} placeholder="Cole ou escreva o enunciado da questão..." />
           </div>
-          <div className="pec-field" style={{ marginBottom: 12 }}>
-            <label>Resposta / gabarito comentado</label>
-            <textarea rows={2} value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="Resposta correta e, se quiser, uma breve explicação" />
-          </div>
+
+          {tipo === "texto" ? (
+            <div className="pec-field" style={{ marginBottom: 12 }}>
+              <label>Resposta / gabarito comentado</label>
+              <textarea rows={2} value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="Resposta correta e, se quiser, uma breve explicação" />
+            </div>
+          ) : (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: "var(--ink-soft)", textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 8 }}>Alternativas</label>
+              {alternatives.map((a) => (
+                <div key={a.letter} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <input type="radio" name="correct" checked={correctLetter === a.letter} onChange={() => setCorrectLetter(a.letter)} title="Marcar como correta" />
+                  <span className="pec-mono" style={{ width: 18, fontWeight: 700, color: correctLetter === a.letter ? "var(--green)" : "var(--ink-soft)" }}>{a.letter}</span>
+                  <input value={a.text} onChange={(e) => updateAlternative(a.letter, e.target.value)} placeholder={`Texto da alternativa ${a.letter}`} style={{ flex: 1, border: "1px solid var(--line)", borderRadius: 6, padding: "7px 9px", fontSize: 13, background: "#FFFDF9", color: "var(--ink)" }} />
+                  {alternatives.length > 2 && <button type="button" className="pec-del" onClick={() => removeAlternative(a.letter)}><Trash2 size={13} /></button>}
+                </div>
+              ))}
+              {alternatives.length < 5 && (
+                <button type="button" className="pec-submit small" onClick={addAlternative}><Plus size={12} /> Adicionar alternativa</button>
+              )}
+              <div className="pec-hint" style={{ marginTop: 6 }}>Marque o círculo ao lado da alternativa correta.</div>
+            </div>
+          )}
+
           <button className="pec-submit" type="submit"><Plus size={15} /> Adicionar questão</button>
         </form>
       )}
+
+      <ImportPanel onImport={onImport} />
 
       <div className="pec-panel">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
@@ -923,9 +1113,23 @@ function QuestionsView({ subjects, topicsBySubject, questions, onAdd, onRemove }
                     <span className="pec-dot" style={{ background: sub ? sub.color : "#999" }} />
                     <span>{sub ? sub.name : "—"}</span>
                     {q.topicId && topicNameById[q.topicId] && <span className="pec-tag">{topicNameById[q.topicId]}</span>}
+                    {q.type === "multipla" && <span className="pec-tag green">Múltipla escolha</span>}
+                    {q.banca && <span className="pec-tag">{q.banca}</span>}
+                    {q.ano && <span className="pec-tag">{q.ano}</span>}
+                    {q.concurso && <span className="pec-tag">{q.concurso}</span>}
+                    {q.numero && <span className="pec-tag">nº {q.numero}</span>}
                     {acc !== null && <span className="pec-tag gold">{acc}% acerto · {q.timesReviewed}x revisada</span>}
                   </div>
                   <div className="pec-qtext">{q.statement}</div>
+                  {q.type === "multipla" && Array.isArray(q.alternatives) && (
+                    <ul className="pec-qalts">
+                      {q.alternatives.map((a) => (
+                        <li key={a.letter} className={a.letter === q.correctLetter ? "correct" : ""}>
+                          <b>{a.letter}</b> {a.text}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                   <button className="pec-del pec-qdel" onClick={() => onRemove(q.id)} aria-label="Remover questão"><Trash2 size={13} /></button>
                 </div>
               );
@@ -944,6 +1148,7 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
   const [deck, setDeck] = useState([]);
   const [index, setIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
+  const [selectedLetter, setSelectedLetter] = useState(null);
   const [session, setSession] = useState({ acertos: 0, erros: 0 });
   const [started, setStarted] = useState(false);
 
@@ -957,6 +1162,7 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
     setDeck(shuffle(pool));
     setIndex(0);
     setFlipped(false);
+    setSelectedLetter(null);
     setSession({ acertos: 0, erros: 0 });
     setStarted(true);
   }
@@ -965,6 +1171,7 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
     const q = deck[index];
     onResult(q.id, correct);
     setSession((s) => ({ acertos: s.acertos + (correct ? 1 : 0), erros: s.erros + (correct ? 0 : 1) }));
+    setSelectedLetter(null);
     if (index + 1 < deck.length) {
       setIndex(index + 1);
       setFlipped(false);
@@ -973,13 +1180,19 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
     }
   }
 
+  function pickAlternative(letter) {
+    if (selectedLetter) return;
+    setSelectedLetter(letter);
+  }
+
   const finished = started && index >= deck.length && deck.length > 0;
   const current = started && !finished ? deck[index] : null;
   const subjectById = useMemo(() => { const m = {}; subjects.forEach((s) => (m[s.id] = s)); return m; }, [subjects]);
+  const isMultipla = current && current.type === "multipla" && Array.isArray(current.alternatives) && current.alternatives.length > 0;
 
   return (
     <>
-      <Header title="Revisão" sub="Revise suas questões cadastradas no formato de flashcards" />
+      <Header title="Revisão" sub="Revise suas questões cadastradas no formato de flashcards ou múltipla escolha" />
 
       {!started || finished ? (
         <div className="pec-panel">
@@ -1023,39 +1236,79 @@ function ReviewView({ subjects, topicsBySubject, questions, onResult }) {
             <span className="pec-mono" style={{ color: "#B33F3F" }}>{session.erros} erradas</span>
           </div>
 
-          <div className={`pec-flashcard ${flipped ? "flipped" : ""}`} onClick={() => setFlipped((f) => !f)}>
-            <div className="pec-flashcard-inner">
-              <div className="pec-flashcard-face front">
-                {current && (
-                  <>
-                    <div className="pec-flashcard-tag" style={{ background: subjectById[current.subjectId]?.color || "#999" }}>
-                      {subjectById[current.subjectId]?.name || "Disciplina"}
-                    </div>
-                    <div className="pec-flashcard-text">{current.statement}</div>
-                    <div className="pec-flashcard-hint">Toque para ver a resposta</div>
-                  </>
-                )}
-              </div>
-              <div className="pec-flashcard-face back">
-                {current && (
-                  <>
-                    <div className="pec-flashcard-tag gold">Resposta</div>
-                    <div className="pec-flashcard-text">{current.answer}</div>
-                  </>
-                )}
-              </div>
+          {current && (current.banca || current.ano || current.concurso || current.numero) && (
+            <div className="pec-review-meta">
+              {current.banca && <span className="pec-tag">{current.banca}</span>}
+              {current.ano && <span className="pec-tag">{current.ano}</span>}
+              {current.concurso && <span className="pec-tag">{current.concurso}</span>}
+              {current.numero && <span className="pec-tag">nº {current.numero}</span>}
             </div>
-          </div>
+          )}
 
-          {flipped ? (
-            <div className="pec-review-actions">
-              <button className="pec-answer-btn wrong" onClick={() => answer(false)}><XIcon size={16} /> Errei</button>
-              <button className="pec-answer-btn right" onClick={() => answer(true)}><Check size={16} /> Acertei</button>
+          {isMultipla ? (
+            <div className="pec-mc-card">
+              <div className="pec-flashcard-tag" style={{ background: subjectById[current.subjectId]?.color || "#999" }}>
+                {subjectById[current.subjectId]?.name || "Disciplina"}
+              </div>
+              <div className="pec-mc-statement">{current.statement}</div>
+              <div className="pec-mc-options">
+                {current.alternatives.map((a) => {
+                  let cls = "";
+                  if (selectedLetter) {
+                    if (a.letter === current.correctLetter) cls = "correct";
+                    else if (a.letter === selectedLetter) cls = "wrong";
+                    else cls = "disabled";
+                  }
+                  return (
+                    <button key={a.letter} className={`pec-mc-option ${cls}`} onClick={() => pickAlternative(a.letter)} disabled={!!selectedLetter}>
+                      <b>{a.letter}</b> {a.text}
+                    </button>
+                  );
+                })}
+              </div>
+              {selectedLetter && (
+                <div className="pec-review-actions" style={{ marginTop: 18 }}>
+                  <button className="pec-submit" onClick={() => answer(selectedLetter === current.correctLetter)}>Próxima</button>
+                </div>
+              )}
             </div>
           ) : (
-            <div className="pec-review-actions">
-              <button className="pec-submit" onClick={() => setFlipped(true)}>Mostrar resposta</button>
-            </div>
+            <>
+              <div className={`pec-flashcard ${flipped ? "flipped" : ""}`} onClick={() => setFlipped((f) => !f)}>
+                <div className="pec-flashcard-inner">
+                  <div className="pec-flashcard-face front">
+                    {current && (
+                      <>
+                        <div className="pec-flashcard-tag" style={{ background: subjectById[current.subjectId]?.color || "#999" }}>
+                          {subjectById[current.subjectId]?.name || "Disciplina"}
+                        </div>
+                        <div className="pec-flashcard-text">{current.statement}</div>
+                        <div className="pec-flashcard-hint">Toque para ver a resposta</div>
+                      </>
+                    )}
+                  </div>
+                  <div className="pec-flashcard-face back">
+                    {current && (
+                      <>
+                        <div className="pec-flashcard-tag gold">Resposta</div>
+                        <div className="pec-flashcard-text">{current.answer}</div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {flipped ? (
+                <div className="pec-review-actions">
+                  <button className="pec-answer-btn wrong" onClick={() => answer(false)}><XIcon size={16} /> Errei</button>
+                  <button className="pec-answer-btn right" onClick={() => answer(true)}><Check size={16} /> Acertei</button>
+                </div>
+              ) : (
+                <div className="pec-review-actions">
+                  <button className="pec-submit" onClick={() => setFlipped(true)}>Mostrar resposta</button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -1859,6 +2112,11 @@ const STYLES = `
   .pec-tag.gold { background: rgba(200,155,60,0.18); color: var(--gold); }
   .pec-qtext { font-size: 13px; line-height: 1.5; padding-right: 26px; }
   .pec-qdel { position: absolute; top: 10px; right: 10px; }
+  .pec-qalts { list-style: none; margin: 10px 0 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .pec-qalts li { font-size: 12px; color: var(--ink-soft); padding: 4px 8px; border-radius: 5px; }
+  .pec-qalts li b { color: var(--ink); margin-right: 6px; }
+  .pec-qalts li.correct { background: rgba(47,111,78,0.1); color: var(--green); font-weight: 600; }
+  .pec-qalts li.correct b { color: var(--green); }
 
   .pec-pomodoro-card { text-align: center; padding: 30px 22px; }
   .pec-pomodoro-phase { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 8px; }
@@ -1886,6 +2144,20 @@ const STYLES = `
   .pec-daycard .pec-inline-form select { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12.5px; background: #FFFDF9; color: var(--ink); flex: 1; }
 
   .pec-review-summary { border-bottom: 1px solid var(--line); margin-bottom: 16px; padding-bottom: 14px; }
+  .pec-review-meta { display: flex; gap: 6px; justify-content: center; margin-bottom: 4px; flex-wrap: wrap; }
+
+  .pec-mc-card { width: 100%; max-width: 560px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 26px; box-shadow: 0 2px 10px rgba(20,33,61,0.06); }
+  .pec-mc-statement { font-size: 15px; line-height: 1.55; font-family: 'Space Grotesk', sans-serif; font-weight: 500; margin: 14px 0 18px 0; }
+  .pec-mc-options { display: flex; flex-direction: column; gap: 8px; }
+  .pec-mc-option { text-align: left; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: #FFFDF9; font-size: 13px; color: var(--ink); cursor: pointer; }
+  .pec-mc-option:hover:not(:disabled) { border-color: var(--gold); background: rgba(200,155,60,0.06); }
+  .pec-mc-option b { margin-right: 8px; color: var(--ink-soft); }
+  .pec-mc-option.correct { background: rgba(47,111,78,0.12); border-color: var(--green); color: var(--green); }
+  .pec-mc-option.correct b { color: var(--green); }
+  .pec-mc-option.wrong { background: rgba(179,63,63,0.1); border-color: var(--coral); color: var(--coral); }
+  .pec-mc-option.wrong b { color: var(--coral); }
+  .pec-mc-option.disabled { opacity: 0.5; }
+  .pec-mc-option:disabled { cursor: default; }
   .pec-review-summary-title { font-family: 'Space Grotesk', sans-serif; font-size: 17px; font-weight: 600; }
 
   .pec-review-stage { display: flex; flex-direction: column; align-items: center; gap: 20px; padding: 10px 0 30px; }
